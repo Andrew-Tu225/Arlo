@@ -46,45 +46,44 @@ User sends Discord message
     ↓
 bot.py: on_message fires
     ↓
-handlers.py:
-  - Drop bot's own messages, messages outside DISCORD_GUILD_ID, empty messages
-  - Build context window: fetch last CONTEXT_WINDOW_SIZE (default: 12) messages
-  - Start Discord typing indicator
+handlers.py — Filter gate (drop silently if any match):
+  - message.author == bot itself
+  - message.guild.id != DISCORD_GUILD_ID
+  - message.author.id != DISCORD_USER_ID   ← single-user enforcement
+  - message.content is empty
     ↓
-classifier.py — ONE LLM call (structured output)
-  → { tone: casual|task|venting|excited, intent: chat|task|memory_update }
-  → on parse failure: default to { casual, chat } — never crash
+INSERT into episodic_messages (async, non-blocking)
+Build context window: last CONTEXT_WINDOW_SIZE rows from episodic_messages (default: 12)
     ↓
-Route by intent (tone passes through to persona builder, does not change routing):
-
-  [chat]
-    store.py: embed message → pgvector similarity search → top-K relevant memories
-    persona.py: build system prompt (anti-bot persona rules + injected memories + tone hint)
-    llm.py: generate reply
-    → Discord: send plain text reply
-
-  [task]
-    guardrail check: reject harmful/impossible requests before the loop starts
-    planner.py: ONE LLM call decomposes goal into ordered step list
-    orchestrator.py: LangGraph ReAct loop (hard ceiling MAX_REACT_ITERATIONS=8)
-      Reason node → choose next action
-        web_search() via Tavily
-        read_url() via Jina Reader
-          ↑ URL validated here: reject non-http(s), private IPs, malformed — no raw LLM URLs
-      Synthesize node → LLM compiles final answer + inline source URLs
-      On cap/budget hit without answer → "couldn't find a reliable source" (no hallucination)
-    → Discord: send answer with sources
-
-  [memory_update]
-    store.py: mem0.add() — contradiction resolution, short-term vs long-term tag
-    → Discord: short natural ack ("got it")
-
+Unified LangGraph Agent (orchestrator.py)
+  System prompt (persona.py):
+    - Persona rules (anti-bot tone, has opinions, matches energy)
+    - Content guardrails (refuses harmful requests, won't impersonate, stays honest)
+    - Basic profile summary (location, key interests injected from mem0)
+    - Tone guidance
+  Tools:
+    - web_search(query)   → Tavily API
+    - read_url(url)       → URL validation → Jina Reader (r.jina.ai/{url})
+    - search_memory(q)    → mem0 semantic search (on-demand user context)
+    - remember(fact)      → mem0.add() with contradiction handling
+    ↓
+  The model decides (no separate classifier call):
+    Casual message       → respond directly, no tool calls
+    Task request         → calls web_search / read_url (ReAct loop)
+    Memory-worthy stmt   → calls remember()
+    Needs user context   → calls search_memory() mid-reasoning
+    ↓
+  ReAct loop ceiling: MAX_REACT_ITERATIONS (default: 8)
+    → On ceiling hit or TASK_TOKEN_BUDGET exceeded:
+       honest "couldn't find a reliable source" reply, no hallucination
+    ↓
+Discord: send reply (plain text)
     ↓
 [after reply — non-blocking]
   message_count % PROFILE_EXTRACTION_INTERVAL == 0?
     → asyncio.create_task(extractor.py):
-        pull last N messages from episodic log
-        ONE LLM call extracts facts (interests, preferences, opinions, habits)
+        read last N rows from episodic_messages
+        ONE LLM call: extract facts (interests, preferences, opinions, habits)
         mem0.add() for each fact with short-term/long-term tag
 ```
 
@@ -93,7 +92,7 @@ Route by intent (tone passes through to persona builder, does not change routing
 The Discord bot is a long-running process. APScheduler runs jobs inside that process and can send Discord messages at any time without a user prompt. This is how all proactive outreach works — no MCP or webhooks needed for MVP.
 
 ```
-APScheduler daily job fires (user-configurable time, default: 9am)
+APScheduler daily job fires at DIGEST_TIME in DIGEST_TIMEZONE (default: 09:00 America/Toronto)
     ↓
 digest.py:
   1. mem0.search("interests preferences habits") → user profile snapshot
@@ -104,7 +103,7 @@ digest.py:
   5. discord.get_channel(channel_id).send(message)
 
 Job config (schedule, channel, on/off state) persisted in PostgreSQL.
-On bot restart: re-read config from DB and re-register the job.
+On bot restart: re-read config from DB, re-register with misfire_grace_time=3600.
 /digest off → pause; /digest on → resume.
 ```
 
@@ -119,20 +118,22 @@ On bot restart: re-read config from DB and re-register the job.
 
 ### ReAct Loop Detail
 
+No separate planner — the reason node handles step-by-step decomposition inline.
+
 ```
-planner.py: goal → ordered step list (ONE LLM call)
-    ↓
 orchestrator.py: LangGraph graph
-  ┌─ Reason node: LLM decides next tool call
+  ┌─ Reason node: LLM decides next tool call (or whether to synthesize)
   │
-  ├─ web_search(query) → Tavily API → list of {url, snippet}
+  ├─ web_search(query) → Tavily API → list of {url, title, snippet}
   │
-  ├─ read_url(url)     → validate URL → Jina Reader (r.jina.ai/{url}) → page text
-  │                      (reject if: not http(s), private IP, malformed, unresolvable)
+  ├─ read_url(url)     → SSRF validation → Jina Reader (r.jina.ai/{url}) → page text
+  │                      (reject: non-http(s), RFC 1918, loopback, link-local, malformed)
+  │
+  ├─ search_memory(q)  → mem0 semantic search → relevant user facts
   │
   └─ synthesize()      → LLM compiles all observations into final answer + source URLs
     ↓
-Exit conditions (whichever comes first):
+Exit conditions (first one wins):
   - synthesize reached
   - MAX_REACT_ITERATIONS=8 hit → honest "couldn't find a reliable source"
   - TASK_TOKEN_BUDGET exceeded → same honest fallback
@@ -142,10 +143,10 @@ Exit conditions (whichever comes first):
 
 | Layer | What's stored | Storage | How retrieved |
 |---|---|---|---|
-| Short-term | Last CONTEXT_WINDOW_SIZE Discord messages | In-context (deque) | Passed directly in prompt |
-| Long-term semantic | Facts, preferences, traits (vector) | PostgreSQL + pgvector | mem0 similarity search — top-K per message |
-| Long-term structured | Same facts in structured form | PostgreSQL | mem0 query by dimension |
-| Episodic | Raw interaction log | PostgreSQL | Read by extraction job after N messages |
+| Short-term context | Last CONTEXT_WINDOW_SIZE messages | PostgreSQL `episodic_messages` | SELECT last N rows, passed directly in prompt |
+| Long-term semantic | Facts, preferences, traits (vector) | PostgreSQL + pgvector | `search_memory` tool — semantic similarity search |
+| Long-term structured | Same facts, structured form | PostgreSQL (via mem0) | mem0 query by dimension |
+| Episodic log | Raw interaction history | PostgreSQL `episodic_messages` | Read by extraction job every N messages |
 
 **How embeddings work:** mem0 converts each stored fact into a vector (array of numbers) representing its meaning. Similar texts get nearby vectors. When Arlo receives a message, it embeds the query and retrieves the most semantically similar stored facts — so "what should I eat?" surfaces "user is vegetarian" and "user loves spicy food" without scanning every stored memory.
 
@@ -156,42 +157,48 @@ arlo/
 ├── core/
 │   ├── llm.py                   # LLM client abstraction (OpenAI or OpenRouter)
 │   ├── memory/
-│   │   ├── extractor.py         # Passive profile extraction from messages
-│   │   ├── store.py             # Read/write/update via mem0 + Supabase
+│   │   ├── extractor.py         # Passive profile extraction from episodic_messages
+│   │   ├── store.py             # Read/write/update via mem0 (self-hosted)
 │   │   └── models.py            # UserProfile, MemoryEntry schemas
 │   ├── agent/
-│   │   ├── orchestrator.py      # LangGraph ReAct loop
-│   │   ├── planner.py           # Task decomposition
-│   │   ├── classifier.py        # Tone + intent classification (single call)
-│   │   └── persona.py           # System prompt builder with memory injection
+│   │   ├── orchestrator.py      # Unified LangGraph agent (4 tools: web_search, read_url, search_memory, remember)
+│   │   └── persona.py           # System prompt builder (persona rules + guardrails + memory injection)
 │   ├── tools/
-│   │   ├── search.py            # Tavily web search wrapper
-│   │   └── reader.py            # Jina Reader URL fetcher
+│   │   ├── search.py            # web_search tool: Tavily wrapper
+│   │   └── reader.py            # read_url tool: SSRF validation + Jina Reader
 │   ├── scheduler/
-│   │   └── digest.py            # Daily proactive suggestion engine (APScheduler)
+│   │   └── digest.py            # Daily proactive digest (APScheduler, DIGEST_TIME + DIGEST_TIMEZONE)
 │   ├── interfaces/
 │   │   └── discord/
-│   │       ├── bot.py           # discord.py bot setup
-│   │       ├── handlers.py      # Message event handlers
-│   │       └── commands.py      # /start, /profile, /forget
+│   │       ├── bot.py           # discord.py bot setup + startup validation
+│   │       ├── handlers.py      # on_message: DISCORD_USER_ID filter, episodic INSERT, agent dispatch
+│   │       └── commands.py      # /start, /profile, /forget, /digest
 │   └── api.py                   # FastAPI app (health check + future hooks)
 ├── tests/
 ├── docs/
-│   └── prd.md
+│   ├── prd.md
+│   └── architecture.md
 ├── .env.example
 ├── docker-compose.yml
 ├── requirements.txt
 └── README.md
 ```
 
+**Not in codebase (removed post eng-review):**
+- `core/agent/classifier.py` — Removed. The unified agent routes implicitly via tool-calling behavior; no separate classifier call.
+- `core/agent/planner.py` — Removed. The ReAct reason node handles step-by-step planning inline; separate planner = redundant LLM call.
+
 ## Key Conventions
 
 - **No mutations** — always return new objects; don't modify in place
-- **Classifier is one call** — tone + intent resolved in a single LLM call, not two
-- **Memory extraction is background** — runs after every `PROFILE_EXTRACTION_INTERVAL` messages, never blocking the response path
-- **ReAct loop has a hard ceiling** — `MAX_REACT_ITERATIONS=8`, enforced in `orchestrator.py`
-- **Persona is a prompt problem** — `persona.py` builds the system prompt; no special runtime logic
-- **Validate URLs before fetching** — never pass LLM-generated URLs directly to `read_url()` without validation
+- **No classifier call** — the unified LangGraph agent routes implicitly via which tools the model calls; no separate tone/intent classification
+- **No planner call** — the ReAct reason node handles decomposition inline; no separate planner LLM call
+- **Memory extraction is background** — `asyncio.create_task` after every `PROFILE_EXTRACTION_INTERVAL` messages, never blocking the response path
+- **ReAct loop has a hard ceiling** — `MAX_REACT_ITERATIONS=8` and `TASK_TOKEN_BUDGET=8000`, both enforced in `orchestrator.py`
+- **Persona is a prompt problem** — `persona.py` builds the system prompt including guardrails; no special runtime logic
+- **Validate URLs before fetching** — `ipaddress` + `validators` libraries in `reader.py`; never pass LLM-generated URLs directly to Jina Reader
+- **Single-user enforcement in handlers** — `DISCORD_USER_ID` checked on every message in `handlers.py`; missing at startup = halt
+- **Episodic log is the source of truth** — context window reads from `episodic_messages` table, not Discord API
 - **No Firecrawl in MVP** — Jina Reader only; add Firecrawl post-MVP if needed
 
 ## Environment Variables
@@ -212,13 +219,22 @@ TAVILY_API_KEY=
 # Discord
 DISCORD_BOT_TOKEN=
 DISCORD_GUILD_ID=
+DISCORD_USER_ID=                 # Discord user ID — only this user's messages are processed
+
+# Digest scheduler
+DIGEST_TIME=09:00                # HH:MM — time of day for the daily digest
+DIGEST_TIMEZONE=America/Toronto  # IANA timezone string; validated at startup
 
 # App config
 ENVIRONMENT=development
 LOG_LEVEL=info
-PROFILE_EXTRACTION_INTERVAL=10   # extract profile every N messages
-MAX_REACT_ITERATIONS=8
+CONTEXT_WINDOW_SIZE=12           # messages passed as context to the agent
+PROFILE_EXTRACTION_INTERVAL=10   # extract profile facts every N messages
+MAX_REACT_ITERATIONS=8           # hard ceiling on ReAct tool-use loop
+TASK_TOKEN_BUDGET=8000           # max tokens per task; honest fallback on exceed
 ```
+
+Required at startup (missing = halt with clear error): `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_USER_ID`, `DATABASE_URL`, at least one LLM key, `TAVILY_API_KEY`. `DIGEST_TIMEZONE` must be a valid IANA string.
 
 > No `MEM0_API_KEY` needed — mem0 runs in self-hosted mode against `DATABASE_URL`.
 
@@ -232,18 +248,18 @@ pytest
 pytest --cov=core --cov-report=term-missing
 
 # Run a specific module
-pytest tests/test_classifier.py
+pytest tests/test_orchestrator.py
 ```
 
-Minimum coverage: **80%**. Unit tests for tools, memory, and classifier. Integration tests for the ReAct loop end-to-end (use recorded Tavily fixtures to avoid live API calls in CI).
+Minimum coverage: **80%**. Unit tests for tools (SSRF validation, Tavily wrapper), memory (extraction, store), and the agent (ReAct loop, persona builder). Integration tests for the full ReAct loop end-to-end — use recorded Tavily fixtures to avoid live API calls in CI.
 
 ## Build Sequence
 
 | Week | Milestone |
 |---|---|
-| 1–2 | Discord bot + basic LLM conversation end-to-end |
-| 3–4 | Memory: passive extraction + PostgreSQL + pgvector storage |
-| 5–6 | Daily proactive digest via APScheduler |
-| 7–8 | ReAct task loop (Tavily + Jina + LangGraph) |
-| 9–10 | Persona tuning, onboarding `/start`, profile commands, guardrails |
-| 11–12 | Polish, testing, public GitHub launch |
+| 1–2 | Discord bot running, unified LangGraph agent, basic LLM conversation end-to-end, content guardrails in system prompt, startup validation |
+| 3–4 | Memory layer: `episodic_messages` table, passive extraction, PostgreSQL + pgvector storage, `/profile` + `/forget` commands |
+| 5–6 | Daily proactive digest via APScheduler (`DIGEST_TIME` + `DIGEST_TIMEZONE`) |
+| 7–8 | ReAct tools expansion: Tavily search, Jina Reader, `search_memory` tool, URL validation (SSRF) |
+| 9–10 | Persona tuning, `/start` onboarding |
+| 11–12 | Polish, test coverage ≥ 80%, public GitHub launch |

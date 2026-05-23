@@ -13,6 +13,7 @@ asyncpg>=0.29,<0.31
 # Web search & URL reading
 tavily-python>=0.3,<0.5
 httpx>=0.27,<0.29
+validators>=0.22,<0.35          # URL validation for SSRF prevention in reader.py
 
 # Discord interface
 discord.py>=2.3,<3.0
