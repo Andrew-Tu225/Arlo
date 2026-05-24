@@ -1,6 +1,6 @@
 # Arlo
 
-> A persistent AI companion for Discord — texts like a smart friend, remembers you, and gets things done.
+> A persistent AI companion that reaches out, remembers you, and gets things done.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -10,9 +10,15 @@
 
 ## What is Arlo?
 
-Most AI tools treat every conversation like it's your first. Arlo doesn't.
+Arlo is an AI companion that reaches out on its own.
 
-Arlo is an AI companion you talk to through Discord — think of it as a close friend who happens to live in your chat. It remembers you, talks with you like a real person, and over time learns your interests, opinions, and habits. Some days it'll send you something it knows you'll love. Other days you're just catching up. And when you need something done, Arlo can handle that too. No commands, no menus — just a conversation.
+Most AI tools wait to be spoken to. Arlo doesn't. Every morning it searches your interest space and sends you things it knows you'll care about — the way a friend texts you something they saw and thought of you. It also just chats. You can vent, catch up, ask it something random. It's a companion, not a query engine.
+
+It remembers. Your interests, your opinions, your habits — picked up quietly across conversations and recalled naturally. Three months later, it still knows what you care about.
+
+When you need something done, describe it. Arlo searches, reads the sources, and comes back with a real answer — not links, synthesis.
+
+Currently runs on Discord. Telegram and other interfaces on the roadmap.
 
 ---
 
@@ -20,15 +26,15 @@ Arlo is an AI companion you talk to through Discord — think of it as a close f
 
 ### 🧠 Persistent Memory
 
-Arlo quietly learns from every conversation. It picks up on your interests, preferences, and habits — and recalls them naturally later, without you having to repeat yourself. Built on [mem0](https://mem0.ai/) and PostgreSQL with pgvector for semantic recall.
+Arlo learns from every conversation — your interests, opinions, preferences, and habits. Three months from now, it still knows what you care about. Memory is extracted passively — Arlo picks things up from what you say without you tagging or saving anything. Built on [mem0](https://mem0.ai/) and PostgreSQL with pgvector for semantic recall across sessions.
 
-### 💬 Friend-like Interaction
+### 📬 Proactive Outreach
 
-Not a chatbot. Arlo matches your tone, has a consistent voice, and actually engages — like a friend you can vent to, joke with, or just catch up with. It also reaches out on its own: when it finds something it thinks you'd love — a news, new movie release, NBA results, etc — it'll drop it in your chat the way a good friend would, not as a scheduled report, but because it thought of you.
+Arlo doesn't wait. Every morning it searches your interest space — news, releases, results you'd care about — and drops the best ones in your chat the way a friend would text you. It also just chats: you can vent, catch up, or ask it something random. You can pause the daily digest with `/digest off` and resume with `/digest on`.
 
-### 🛠️ Agent Capabilities
+### 🛠️ Task Execution
 
-Describe a goal in plain language — Arlo breaks it down, searches the web, reads sources, and comes back with a real answer and citations. Powered by a [LangGraph](https://github.com/langchain-ai/langgraph) ReAct loop with Tavily web search and Jina Reader.
+Describe a goal in plain language. Arlo breaks it down, searches the web, reads the relevant pages, and returns a synthesized answer with citations — not a list of links, a real answer. Powered by a [LangGraph](https://github.com/langchain-ai/langgraph) ReAct loop with a hard ceiling of 8 tool-use iterations.
 
 ---
 
@@ -38,6 +44,18 @@ Arlo runs two subsystems in parallel inside a single process:
 
 - **Reactive** — responds to your Discord messages: classifies tone and intent, retrieves relevant memories, and routes to chat, task, or memory-update handling.
 - **Proactive** — an APScheduler job that wakes up daily, reads your interest profile, fetches fresh content, and sends a personalized digest to your Discord channel.
+
+---
+
+## Build on Arlo
+
+Arlo is an open source backend for AI companion products. The core is a reusable, opinionated agent stack:
+
+- **Memory layer** — mem0 + pgvector for persistent, semantic user profiles; passive extraction from conversation history
+- **Proactive scheduler** — APScheduler-powered daily outreach that runs inside the bot process; no external queue or cron required
+- **ReAct agent** — LangGraph loop with Tavily search and Jina Reader; hard ceiling of 8 iterations
+
+Fork it, build the wrapper your users need, and deploy via Docker Compose on any VPS.
 
 ---
 
