@@ -14,3 +14,23 @@ on_message pipeline:
   6. After reply: if message_count % PROFILE_EXTRACTION_INTERVAL == 0,
      schedule asyncio.create_task(extractor) — never blocks the response path.
 """
+
+import logging
+
+import discord
+from discord.ext import commands
+
+from core.settings import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+async def handle_message(_bot: commands.Bot, message: discord.Message) -> None:
+    if message.author.bot:
+        return
+    if message.guild is None or message.guild.id != get_settings().discord_guild_id:
+        return
+    if not message.content.strip():
+        return
+
+    logger.info("Message from %s: %s", message.author, message.content)
