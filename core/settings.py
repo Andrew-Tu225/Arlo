@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     # Discord — required
     discord_bot_token: str
     discord_guild_id: int
+    discord_user_id: int
 
     # App config
     environment: Literal["development", "production"] = "development"
