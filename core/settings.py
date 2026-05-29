@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     # Database
     database_url: str = ""
 
+    # Memory (mem0 cloud)
+    mem0_api_key: str = ""
+
     # Search
     tavily_api_key: str = ""
 
