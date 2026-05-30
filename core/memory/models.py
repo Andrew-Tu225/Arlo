@@ -48,4 +48,24 @@ class UserProfile:
     def summary(self) -> str:
         if not self.facts:
             return "No facts stored yet."
-        return "\n".join(f"- {f.content}" for f in self.facts)
+
+        grouped: dict[str, list[str]] = {}
+        ungrouped: list[str] = []
+
+        for fact in self.facts:
+            if ": " in fact.content:
+                dimension, value = fact.content.split(": ", 1)
+                grouped.setdefault(dimension, []).append(value)
+            else:
+                ungrouped.append(fact.content)
+
+        sections: list[str] = []
+        for dimension, values in grouped.items():
+            lines = [f"**{dimension.capitalize()}**"]
+            lines.extend(f"- {v}" for v in values)
+            sections.append("\n".join(lines))
+
+        if ungrouped:
+            sections.append("\n".join(f"- {c}" for c in ungrouped))
+
+        return "\n\n".join(sections)

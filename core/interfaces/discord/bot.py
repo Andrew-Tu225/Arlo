@@ -23,6 +23,7 @@ import discord
 from discord.ext import commands
 
 from core import db
+from core.interfaces.discord import commands as discord_commands
 from core.interfaces.discord import handlers
 from core.settings import get_settings
 
@@ -36,6 +37,9 @@ class ArloBot(commands.Bot):
         self.pool = await db.get_pool(settings.database_url)
         await db.init_tables(self.pool)
         logger.info("DB pool and tables initialised")
+        await discord_commands.setup(self)
+        await self.tree.sync()
+        logger.info("Slash commands registered and synced")
 
 
 def create_bot() -> ArloBot:

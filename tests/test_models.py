@@ -83,3 +83,37 @@ class TestUserProfile:
     def test_summary_returns_string(self):
         profile = UserProfile(user_id="u1", facts=(self._entry("test fact"),))
         assert isinstance(profile.summary(), str)
+
+    def test_summary_groups_dimensioned_facts_under_bold_header(self):
+        facts = (
+            self._entry("hobby: loves hiking"),
+            self._entry("hobby: plays piano"),
+            self._entry("work: software developer"),
+        )
+        summary = UserProfile(user_id="u1", facts=facts).summary()
+        assert "**Hobby**" in summary
+        assert "**Work**" in summary
+        hobby_pos = summary.index("**Hobby**")
+        assert summary.index("loves hiking") > hobby_pos
+        assert summary.index("plays piano") > hobby_pos
+
+    def test_summary_capitalizes_dimension_header(self):
+        profile = UserProfile(user_id="u1", facts=(self._entry("diet: vegetarian"),))
+        assert "**Diet**" in profile.summary()
+
+    def test_summary_plain_facts_still_appear(self):
+        facts = (
+            self._entry("diet: vegetarian"),
+            self._entry("no dimension here"),
+        )
+        summary = UserProfile(user_id="u1", facts=facts).summary()
+        assert "vegetarian" in summary
+        assert "no dimension here" in summary
+
+    def test_summary_groups_separated_by_blank_line(self):
+        facts = (
+            self._entry("diet: vegetarian"),
+            self._entry("work: engineer"),
+        )
+        summary = UserProfile(user_id="u1", facts=facts).summary()
+        assert "\n\n" in summary
