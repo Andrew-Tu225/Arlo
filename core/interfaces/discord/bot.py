@@ -5,12 +5,13 @@ Startup sequence:
        DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, DISCORD_USER_ID, DATABASE_URL,
        at least one of OPENAI_API_KEY / OPENROUTER_API_KEY, TAVILY_API_KEY.
        DIGEST_TIMEZONE must be a valid IANA timezone string.
-  2. Initialize the asyncpg connection pool (core/db.py).
-  3. Run init_tables() to create episodic_messages and digest_config if they don't exist.
-  4. Register on_message handler (handlers.py).
-  5. Register slash commands (commands.py).
-  6. Start APScheduler digest job (scheduler/digest.py).
-  7. Connect to Discord and begin the event loop.
+  2. setup_hook (called by discord.py after login): initialize the asyncpg pool and
+     run init_tables() to create episodic_messages and digest_config if they don't exist.
+     Pool is attached as bot.pool so handlers.py can access it via getattr(bot, "pool", None).
+  3. Register on_message handler (handlers.py).
+  4. Register slash commands (commands.py).
+  5. Start APScheduler digest job (scheduler/digest.py).
+  6. Connect to Discord and begin the event loop.
 
 Run with:
     python -m core.interfaces.discord.bot
@@ -21,6 +22,7 @@ import logging
 import discord
 from discord.ext import commands
 
+from core import db
 from core.interfaces.discord import handlers
 from core.settings import get_settings
 
@@ -28,10 +30,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 
 
-def create_bot() -> commands.Bot:
+class ArloBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        settings = get_settings()
+        self.pool = await db.get_pool(settings.database_url)
+        await db.init_tables(self.pool)
+        logger.info("DB pool and tables initialised")
+
+
+def create_bot() -> ArloBot:
     intents = discord.Intents.default()
     intents.message_content = True
-    return commands.Bot(command_prefix="!", intents=intents)
+    return ArloBot(command_prefix="!", intents=intents)
 
 
 bot = create_bot()
