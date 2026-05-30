@@ -91,7 +91,7 @@ async def handle_message(bot: commands.Bot, message: discord.Message) -> None:
                 )
 
             context = await _build_context(pool, user_id)
-            response = await orchestrator.run(context)
+            response = await orchestrator.run(context, user_id=user_id)
 
             if len(response) > _MAX_DISCORD_LENGTH:
                 response = response[: _MAX_DISCORD_LENGTH - 3] + "..."
