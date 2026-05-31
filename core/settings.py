@@ -16,12 +16,16 @@ class Settings(BaseSettings):
     # Database
     database_url: str = ""
 
+    # Memory (mem0 cloud)
+    mem0_api_key: str = ""
+
     # Search
     tavily_api_key: str = ""
 
     # Discord — required
     discord_bot_token: str
     discord_guild_id: int
+    discord_user_id: int
 
     # App config
     environment: Literal["development", "production"] = "development"
