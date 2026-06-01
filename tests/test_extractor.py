@@ -158,7 +158,7 @@ class TestFactExtraction:
         assert mock_add.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_fact_formatted_as_dimension_colon_value(self):
+    async def test_passes_value_as_fact_text(self):
         pool = MagicMock()
         messages = [_make_message()]
         facts = [{"dimension": "diet", "value": "vegetarian", "is_short_term": False}]
@@ -174,7 +174,26 @@ class TestFactExtraction:
             patch("core.memory.extractor.store.add", new_callable=AsyncMock) as mock_add,
         ):
             await extractor.maybe_extract(pool, "u1")
-        assert mock_add.call_args.args[0] == "diet: vegetarian"
+        assert mock_add.call_args.args[0] == "vegetarian"
+
+    @pytest.mark.asyncio
+    async def test_passes_dimension_to_store(self):
+        pool = MagicMock()
+        messages = [_make_message()]
+        facts = [{"dimension": "diet", "value": "vegetarian", "is_short_term": False}]
+        with (
+            patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
+            patch(
+                "core.memory.extractor.db.get_recent_messages",
+                new_callable=AsyncMock,
+                return_value=messages,
+            ),
+            patch("core.memory.extractor.llm.get_client", return_value=_make_client(facts)),
+            patch("core.memory.extractor.store.add", new_callable=AsyncMock) as mock_add,
+        ):
+            await extractor.maybe_extract(pool, "u1")
+        assert mock_add.call_args.kwargs.get("dimension") == "diet"
 
     @pytest.mark.asyncio
     async def test_passes_short_term_true(self):

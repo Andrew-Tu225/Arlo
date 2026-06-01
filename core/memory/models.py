@@ -25,12 +25,14 @@ class MemoryEntry:
 
     short_term=True  → time-bound context (decays in relevance)
     short_term=False → stable long-term trait
+    dimension        → short category label from extraction (e.g. "hobby", "goal")
     """
 
     id: str
     content: str
     short_term: bool
     created_at: datetime
+    dimension: str | None = None
 
 
 @dataclass(frozen=True)
@@ -50,22 +52,22 @@ class UserProfile:
             return "No facts stored yet."
 
         grouped: dict[str, list[str]] = {}
-        ungrouped: list[str] = []
-
         for fact in self.facts:
-            if ": " in fact.content:
+            if fact.dimension:
+                key = fact.dimension.strip().capitalize()
+                grouped.setdefault(key, []).append(fact.content)
+            elif ": " in fact.content:
+                # Legacy format: stored as "dimension: value" before dimension metadata existed.
                 dimension, value = fact.content.split(": ", 1)
-                grouped.setdefault(dimension, []).append(value)
+                key = dimension.strip().capitalize()
+                grouped.setdefault(key, []).append(value)
             else:
-                ungrouped.append(fact.content)
+                grouped.setdefault("Other", []).append(fact.content)
 
         sections: list[str] = []
-        for dimension, values in grouped.items():
-            lines = [f"**{dimension.capitalize()}**"]
+        for category, values in grouped.items():
+            lines = [f"**{category}**"]
             lines.extend(f"- {v}" for v in values)
             sections.append("\n".join(lines))
-
-        if ungrouped:
-            sections.append("\n".join(f"- {c}" for c in ungrouped))
 
         return "\n\n".join(sections)

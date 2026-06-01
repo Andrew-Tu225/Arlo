@@ -21,11 +21,14 @@ def _make_client(search_results=None, get_all_results=None):
     return client
 
 
-def _memory_result(id_="m1", memory="User is vegetarian", short_term=False):
+def _memory_result(id_="m1", memory="User is vegetarian", short_term=False, dimension=None):
+    metadata: dict = {"short_term": short_term}
+    if dimension is not None:
+        metadata["dimension"] = dimension
     return {
         "id": id_,
         "memory": memory,
-        "metadata": {"short_term": short_term},
+        "metadata": metadata,
         "created_at": _NOW_STR,
     }
 
@@ -63,6 +66,22 @@ class TestAdd:
         call_kwargs = client.add.call_args
         metadata = call_kwargs.kwargs.get("metadata", {})
         assert metadata.get("short_term") is True
+
+    @pytest.mark.asyncio
+    async def test_add_passes_dimension_in_metadata(self):
+        client = _make_client()
+        with patch.object(store, "_get_client", return_value=client):
+            await store.add("vegetarian", "u1", short_term=False, dimension="diet")
+        metadata = client.add.call_args.kwargs.get("metadata", {})
+        assert metadata.get("dimension") == "diet"
+
+    @pytest.mark.asyncio
+    async def test_add_omits_dimension_when_none(self):
+        client = _make_client()
+        with patch.object(store, "_get_client", return_value=client):
+            await store.add("some fact", "u1", short_term=False)
+        metadata = client.add.call_args.kwargs.get("metadata", {})
+        assert "dimension" not in metadata
 
 
 class TestSearch:
@@ -153,6 +172,15 @@ class TestGetAll:
         assert entry.content == "hates layovers"
         assert entry.short_term is False
         assert entry.created_at == _NOW
+        assert entry.dimension is None
+
+    @pytest.mark.asyncio
+    async def test_get_all_reads_dimension_from_metadata(self):
+        raw = _memory_result(memory="vegetarian", dimension="diet")
+        client = _make_client(get_all_results=[raw])
+        with patch.object(store, "_get_client", return_value=client):
+            results = await store.get_all("u1")
+        assert results[0].dimension == "diet"
 
     @pytest.mark.asyncio
     async def test_get_all_returns_empty_list_when_no_memories(self):
