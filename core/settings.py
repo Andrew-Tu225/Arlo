@@ -28,9 +28,8 @@ class Settings(BaseSettings):
     discord_guild_id: int
     discord_user_id: int
 
-    # Digest scheduler
+    # Proactive morning message(default)
     digest_time: str = "09:00"
-    evening_digest_time: str = "20:00"
     digest_timezone: str = "America/Toronto"
 
     # App config

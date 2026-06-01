@@ -3,7 +3,8 @@
 on_message pipeline:
   1. Filter gate — drop silently if any condition matches:
        - message.author is a bot
-       - message.guild.id != DISCORD_GUILD_ID
+       - message is from a guild other than DISCORD_GUILD_ID
+         (DMs pass — message.guild is None for DMs, so the guild check is skipped)
        - message.author.id != DISCORD_USER_ID  (single-user enforcement)
        - message.content is empty
   2. Show typing indicator.
@@ -66,7 +67,8 @@ async def handle_message(bot: commands.Bot, message: discord.Message) -> None:
     # Filter gate
     if message.author.bot:
         return
-    if message.guild is None or message.guild.id != get_settings().discord_guild_id:
+    # check guild id match if exists, otherwise(from DM(no guild id)), pass through without being blocked
+    if message.guild is not None and message.guild.id != get_settings().discord_guild_id:
         return
     if message.author.id != get_settings().discord_user_id:
         return

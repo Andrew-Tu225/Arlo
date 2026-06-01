@@ -46,14 +46,9 @@ class TestDigestTimes:
         s = Settings(**_base_env())
         assert s.digest_time == "09:00"
 
-    def test_default_evening_digest_time(self):
-        s = Settings(**_base_env())
-        assert s.evening_digest_time == "20:00"
-
     def test_custom_digest_time(self):
-        s = Settings(**_base_env(digest_time="07:30", evening_digest_time="21:00"))
+        s = Settings(**_base_env(digest_time="07:30"))
         assert s.digest_time == "07:30"
-        assert s.evening_digest_time == "21:00"
 
 
 class TestTaskTokenBudget:

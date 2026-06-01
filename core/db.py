@@ -7,19 +7,16 @@ Tables managed here:
   episodic_messages — raw interaction log; source of truth for the context
                       window (handlers.py reads) and the extraction job
                       (extractor.py reads). 30-day retention; pruned weekly.
-  digest_config     — APScheduler job state (channel_id, enabled, schedule).
-                      Re-read at startup to re-register the job after restarts.
-  reminders         — user reminders with optional recurrence; digest reads
-                      due reminders for the morning brief.
-  tasks             — user tasks with priority and project grouping; digest
-                      surfaces open tasks in the morning brief and evening wrap-up.
-  notes             — key-value topic notes; upserted by topic so each topic
-                      has exactly one current version.
+  schedules         — all proactive jobs Arlo runs for the user: DM-based or
+                      channel-based, cron or event-driven. The morning proactive
+                      DM is seeded here at startup so the orchestrator can
+                      search, edit, or delete it via conversation in Phase 4.
+  arlo_channels     — Discord channels Arlo manages, each with a topic/purpose.
+                      Phase 4: handlers.py injects channel topic into the
+                      orchestrator prompt for channel-aware conversation.
 """
 
 from __future__ import annotations
-
-from datetime import date, datetime
 
 import asyncpg
 
@@ -48,56 +45,38 @@ async def init_tables(pool: asyncpg.Pool) -> None:
                 ON episodic_messages (user_id, created_at DESC)
         """)
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS digest_config (
-                user_id    TEXT PRIMARY KEY,
-                channel_id TEXT NOT NULL,
-                enabled    BOOLEAN NOT NULL DEFAULT true,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            CREATE TABLE IF NOT EXISTS schedules (
+                id                  SERIAL PRIMARY KEY,
+                user_id             TEXT NOT NULL,
+                name                TEXT NOT NULL,
+                task                TEXT NOT NULL,
+                discord_channel_id  TEXT,
+                channel_topic       TEXT,
+                cron_schedule       TEXT,
+                poll_interval_secs  INTEGER,
+                last_sent_at        TIMESTAMPTZ,
+                enabled             BOOLEAN NOT NULL DEFAULT true,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (user_id, name)
             )
         """)
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS reminders (
-                id         SERIAL PRIMARY KEY,
-                user_id    TEXT NOT NULL,
-                text       TEXT NOT NULL,
-                due_at     TIMESTAMPTZ,
-                recurrence TEXT,
-                status     TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS reminders_user_status_idx
-                ON reminders (user_id, status, due_at)
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                id         SERIAL PRIMARY KEY,
-                user_id    TEXT NOT NULL,
-                text       TEXT NOT NULL,
-                due_date   DATE,
-                priority   TEXT NOT NULL DEFAULT 'normal',
-                project    TEXT,
-                status     TEXT NOT NULL DEFAULT 'open',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS tasks_user_status_idx
-                ON tasks (user_id, status)
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS notes (
-                id         SERIAL PRIMARY KEY,
-                user_id    TEXT NOT NULL,
-                topic      TEXT NOT NULL,
-                content    TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                UNIQUE (user_id, topic)
+            CREATE TABLE IF NOT EXISTS arlo_channels (
+                id                  SERIAL PRIMARY KEY,
+                user_id             TEXT NOT NULL,
+                discord_channel_id  TEXT NOT NULL,
+                name                TEXT NOT NULL,
+                topic               TEXT NOT NULL,
+                enabled             BOOLEAN NOT NULL DEFAULT true,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (user_id, discord_channel_id)
             )
         """)
 
+
+# ---------------------------------------------------------------------------
+# Episodic messages
+# ---------------------------------------------------------------------------
 
 async def insert_episodic_message(
     pool: asyncpg.Pool,
@@ -160,230 +139,234 @@ async def prune_old_messages(pool: asyncpg.Pool, *, days: int = 30) -> None:
         )
 
 
-async def get_digest_config(pool: asyncpg.Pool, *, user_id: str) -> dict | None:
-    """Return the digest config row for user_id, or None if not set."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT user_id, channel_id, enabled FROM digest_config WHERE user_id = $1",
-            user_id,
-        )
-    if not rows:
-        return None
-    row = rows[0]
-    return {k: row[k] for k in ("user_id", "channel_id", "enabled")}
+# ---------------------------------------------------------------------------
+# Schedules
+#
+# All proactive Arlo jobs live here — DM-based and channel-based alike.
+# discord_channel_id = null means DM the user directly.
+#
+# Phase 4 orchestrator tools (list_schedules, edit_schedule, delete_schedule)
+# read and write this table conversationally.
+# ---------------------------------------------------------------------------
+
+_SCHEDULE_COLS = (
+    "id", "user_id", "name", "task", "discord_channel_id", "channel_topic",
+    "cron_schedule", "poll_interval_secs", "last_sent_at", "enabled", "created_at",
+)
 
 
-async def upsert_digest_config(
+async def insert_schedule(
     pool: asyncpg.Pool,
     *,
     user_id: str,
-    channel_id: str,
-    enabled: bool,
-) -> None:
-    """Insert or update the digest config row for user_id."""
+    name: str,
+    task: str,
+    discord_channel_id: str | None = None,
+    channel_topic: str | None = None,
+    cron_schedule: str | None = None,
+    poll_interval_secs: int | None = None,
+) -> int:
+    """Insert a schedule and return its id.
+
+    Idempotent: if (user_id, name) already exists, returns the existing id
+    without modifying the row. Use update_schedule to change an existing one.
+    """
     async with pool.acquire() as conn:
-        await conn.execute(
+        row = await conn.fetchrow(
             """
-            INSERT INTO digest_config (user_id, channel_id, enabled, updated_at)
-            VALUES ($1, $2, $3, now())
-            ON CONFLICT (user_id) DO UPDATE
-                SET channel_id = EXCLUDED.channel_id,
-                    enabled    = EXCLUDED.enabled,
-                    updated_at = now()
+            INSERT INTO schedules
+                (user_id, name, task, discord_channel_id, channel_topic, cron_schedule, poll_interval_secs)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (user_id, name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            """,
+            user_id, name, task, discord_channel_id, channel_topic, cron_schedule, poll_interval_secs,
+        )
+    return row["id"]
+
+
+async def get_schedule(pool: asyncpg.Pool, *, schedule_id: int) -> dict | None:
+    """Return the schedule row for the given id, or None."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, name, task, discord_channel_id, channel_topic,
+                   cron_schedule, poll_interval_secs, last_sent_at, enabled, created_at
+            FROM schedules
+            WHERE id = $1
+            """,
+            schedule_id,
+        )
+    if not rows:
+        return None
+    return {k: rows[0][k] for k in _SCHEDULE_COLS}
+
+
+async def get_enabled_schedules(pool: asyncpg.Pool, *, user_id: str) -> list[dict]:
+    """Return all enabled schedules for user_id, ordered by id."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, name, task, discord_channel_id, channel_topic,
+                   cron_schedule, poll_interval_secs, last_sent_at, enabled, created_at
+            FROM schedules
+            WHERE user_id = $1 AND enabled = true
+            ORDER BY id ASC
             """,
             user_id,
-            channel_id,
+        )
+    return [{k: row[k] for k in _SCHEDULE_COLS} for row in rows]
+
+
+async def update_schedule(
+    pool: asyncpg.Pool,
+    *,
+    schedule_id: int,
+    task: str | None = None,
+    cron_schedule: str | None = None,
+    discord_channel_id: str | None = None,
+    channel_topic: str | None = None,
+    enabled: bool | None = None,
+) -> None:
+    """Update one or more fields on a schedule row.
+
+    Only fields passed as non-None are updated. Used by Phase 4 orchestrator
+    tools when the user edits a schedule via conversation.
+    """
+    fields: list[str] = []
+    values: list = []
+    for col, val in [
+        ("task", task),
+        ("cron_schedule", cron_schedule),
+        ("discord_channel_id", discord_channel_id),
+        ("channel_topic", channel_topic),
+        ("enabled", enabled),
+    ]:
+        if val is not None:
+            fields.append(f"{col} = ${len(values) + 1}")
+            values.append(val)
+    if not fields:
+        return
+    values.append(schedule_id)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE schedules SET {', '.join(fields)} WHERE id = ${len(values)}",
+            *values,
+        )
+
+
+async def delete_schedule(pool: asyncpg.Pool, *, schedule_id: int) -> None:
+    """Permanently delete a schedule row.
+
+    Used by Phase 4 orchestrator tools when the user removes a schedule via
+    conversation. Callers should also remove the corresponding APScheduler job:
+      scheduler.remove_job(f"schedule_{schedule_id}")
+    """
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM schedules WHERE id = $1", schedule_id)
+
+
+async def set_schedules_enabled(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    enabled: bool,
+) -> None:
+    """Enable or disable all schedules for user_id."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE schedules SET enabled = $2 WHERE user_id = $1",
+            user_id,
             enabled,
         )
 
 
-# ---------------------------------------------------------------------------
-# Reminders
-# ---------------------------------------------------------------------------
-
-_REMINDER_COLS = ("id", "user_id", "text", "due_at", "recurrence", "status", "created_at")
-
-
-async def insert_reminder(
-    pool: asyncpg.Pool,
-    *,
-    user_id: str,
-    text: str,
-    due_at: datetime | None,
-    recurrence: str | None,
-) -> int:
-    """Insert a reminder and return its new id."""
-    async with pool.acquire() as conn:
-        return await conn.fetchval(
-            """
-            INSERT INTO reminders (user_id, text, due_at, recurrence)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id
-            """,
-            user_id,
-            text,
-            due_at,
-            recurrence,
-        )
-
-
-async def get_open_reminders(pool: asyncpg.Pool, *, user_id: str) -> list[dict]:
-    """Return all pending reminders for user_id, ordered by due_at ascending."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, user_id, text, due_at, recurrence, status, created_at
-            FROM reminders
-            WHERE user_id = $1 AND status = 'pending'
-            ORDER BY due_at ASC NULLS LAST
-            """,
-            user_id,
-        )
-    return [{k: row[k] for k in _REMINDER_COLS} for row in rows]
-
-
-async def get_due_reminders(
-    pool: asyncpg.Pool,
-    *,
-    user_id: str,
-    before: datetime,
-) -> list[dict]:
-    """Return pending reminders with due_at <= before."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, user_id, text, due_at, recurrence, status, created_at
-            FROM reminders
-            WHERE user_id = $1 AND due_at <= $2 AND status = 'pending'
-            ORDER BY due_at ASC
-            """,
-            user_id,
-            before,
-        )
-    return [{k: row[k] for k in _REMINDER_COLS} for row in rows]
-
-
-async def update_reminder_status(
-    pool: asyncpg.Pool,
-    *,
-    reminder_id: int,
-    status: str,
-) -> None:
-    """Update the status of a single reminder."""
+async def update_schedule_last_sent(pool: asyncpg.Pool, *, schedule_id: int) -> None:
+    """Set last_sent_at = now() for the given schedule."""
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE reminders SET status = $1 WHERE id = $2",
-            status,
-            reminder_id,
+            "UPDATE schedules SET last_sent_at = now() WHERE id = $1",
+            schedule_id,
         )
 
 
 # ---------------------------------------------------------------------------
-# Tasks
+# Arlo channels (Phase 4 — channel registry for conversation context)
+#
+# When user sends a message in a channel Arlo manages, handlers.py will look
+# up the channel here and inject its topic into the orchestrator system prompt.
 # ---------------------------------------------------------------------------
 
-_TASK_COLS = ("id", "user_id", "text", "due_date", "priority", "project", "status", "created_at")
+_CHANNEL_COLS = ("id", "user_id", "discord_channel_id", "name", "topic", "enabled", "created_at")
 
 
-async def insert_task(
+async def insert_channel(
     pool: asyncpg.Pool,
     *,
     user_id: str,
-    text: str,
-    due_date: date | None,
-    priority: str = "normal",
-    project: str | None,
-) -> int:
-    """Insert a task and return its new id."""
-    async with pool.acquire() as conn:
-        return await conn.fetchval(
-            """
-            INSERT INTO tasks (user_id, text, due_date, priority, project)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id
-            """,
-            user_id,
-            text,
-            due_date,
-            priority,
-            project,
-        )
-
-
-async def get_open_tasks(pool: asyncpg.Pool, *, user_id: str) -> list[dict]:
-    """Return open tasks ordered high → normal → low priority, then by created_at."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, user_id, text, due_date, priority, project, status, created_at
-            FROM tasks
-            WHERE user_id = $1 AND status = 'open'
-            ORDER BY
-                CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
-                created_at ASC
-            """,
-            user_id,
-        )
-    return [{k: row[k] for k in _TASK_COLS} for row in rows]
-
-
-async def update_task_status(
-    pool: asyncpg.Pool,
-    *,
-    task_id: int,
-    status: str,
-) -> None:
-    """Update the status of a single task."""
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE tasks SET status = $1 WHERE id = $2",
-            status,
-            task_id,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Notes
-# ---------------------------------------------------------------------------
-
-_NOTE_COLS = ("id", "user_id", "topic", "content", "created_at", "updated_at")
-
-
-async def upsert_note(
-    pool: asyncpg.Pool,
-    *,
-    user_id: str,
+    discord_channel_id: str,
+    name: str,
     topic: str,
-    content: str,
-) -> None:
-    """Insert a note or overwrite content if the topic already exists."""
+) -> int:
+    """Insert a channel row and return its id. If already exists, return the existing id."""
     async with pool.acquire() as conn:
-        await conn.execute(
+        row = await conn.fetchrow(
             """
-            INSERT INTO notes (user_id, topic, content)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (user_id, topic) DO UPDATE
-                SET content    = EXCLUDED.content,
-                    updated_at = now()
+            INSERT INTO arlo_channels (user_id, discord_channel_id, name, topic)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id, discord_channel_id) DO UPDATE SET name = arlo_channels.name
+            RETURNING id
             """,
-            user_id,
-            topic,
-            content,
+            user_id, discord_channel_id, name, topic,
         )
+    return row["id"]
 
 
-async def get_note(pool: asyncpg.Pool, *, user_id: str, topic: str) -> dict | None:
-    """Return the note for (user_id, topic), or None if not found."""
+async def get_channel_by_discord_id(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    discord_channel_id: str,
+) -> dict | None:
+    """Return the channel row for (user_id, discord_channel_id), or None."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, user_id, topic, content, created_at, updated_at
-            FROM notes
-            WHERE user_id = $1 AND topic = $2
+            SELECT id, user_id, discord_channel_id, name, topic, enabled, created_at
+            FROM arlo_channels
+            WHERE user_id = $1 AND discord_channel_id = $2
             """,
-            user_id,
-            topic,
+            user_id, discord_channel_id,
         )
     if not rows:
         return None
-    return {k: rows[0][k] for k in _NOTE_COLS}
+    return {k: rows[0][k] for k in _CHANNEL_COLS}
+
+
+async def get_enabled_channels(pool: asyncpg.Pool, *, user_id: str) -> list[dict]:
+    """Return all enabled channels for user_id, ordered by id."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, discord_channel_id, name, topic, enabled, created_at
+            FROM arlo_channels
+            WHERE user_id = $1 AND enabled = true
+            ORDER BY id ASC
+            """,
+            user_id,
+        )
+    return [{k: row[k] for k in _CHANNEL_COLS} for row in rows]
+
+
+async def set_channels_enabled(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    enabled: bool,
+) -> None:
+    """Enable or disable all channels for user_id."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE arlo_channels SET enabled = $2 WHERE user_id = $1",
+            user_id, enabled,
+        )
