@@ -4,12 +4,6 @@
 /forget <topic>  — mem0 search + delete for facts matching topic; ack on completion.
 
 Both commands are ephemeral (only visible to the invoking user).
-
-Available from Week 3–4 (live when memory extraction goes live).
-
-Not yet implemented (future phases):
-  /start   → Week 9–10 onboarding
-  /digest  → Week 5–6 APScheduler toggle
 """
 
 import logging

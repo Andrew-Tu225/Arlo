@@ -6,11 +6,12 @@ Startup sequence:
        at least one of OPENAI_API_KEY / OPENROUTER_API_KEY, TAVILY_API_KEY.
        DIGEST_TIMEZONE must be a valid IANA timezone string.
   2. setup_hook (called by discord.py after login): initialize the asyncpg pool and
-     run init_tables() to create episodic_messages and digest_config if they don't exist.
+     run init_tables() to create all tables if they don't exist.
      Pool is attached as bot.pool so handlers.py can access it via getattr(bot, "pool", None).
   3. Register on_message handler (handlers.py).
   4. Register slash commands (commands.py).
-  5. Start APScheduler digest job (scheduler/digest.py).
+  5. Start APScheduler, register default morning proactive DM job, and register
+     any user-created channel schedule jobs from the DB (empty in Phase 3).
   6. Connect to Discord and begin the event loop.
 
 Run with:
@@ -25,6 +26,7 @@ from discord.ext import commands
 from core import db
 from core.interfaces.discord import commands as discord_commands
 from core.interfaces.discord import handlers
+from core.scheduler import digest as digest_module
 from core.settings import get_settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -40,6 +42,11 @@ class ArloBot(commands.Bot):
         await discord_commands.setup(self)
         await self.tree.sync()
         logger.info("Slash commands registered and synced")
+        settings = get_settings()
+        await digest_module.seed_default_schedules(self.pool, str(settings.discord_user_id))
+        digest_module.scheduler.start()
+        await digest_module.register_digest_jobs(self, self.pool)
+        logger.info("Scheduler started and jobs registered")
 
 
 def create_bot() -> ArloBot:

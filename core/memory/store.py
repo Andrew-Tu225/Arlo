@@ -40,13 +40,21 @@ def _get_client() -> MemoryClient:
     return MemoryClient(api_key=get_settings().mem0_api_key)
 
 
-async def add(fact: str, user_id: str, short_term: bool) -> None:
+async def add(
+    fact: str,
+    user_id: str,
+    short_term: bool,
+    dimension: str | None = None,
+) -> None:
     client = _get_client()
+    metadata: dict = {"short_term": short_term}
+    if dimension is not None:
+        metadata["dimension"] = dimension
     await asyncio.to_thread(
         client.add,
         [{"role": "user", "content": fact}],
         user_id=user_id,
-        metadata={"short_term": short_term},
+        metadata=metadata,
     )
 
 
@@ -76,11 +84,14 @@ async def get_all(user_id: str) -> list[MemoryEntry]:
             created_at = raw_ts
         else:
             created_at = datetime.now(timezone.utc)
-        short_term = r.get("metadata", {}).get("short_term", False)
+        metadata = r.get("metadata", {})
+        short_term = metadata.get("short_term", False)
+        dimension = metadata.get("dimension") or None
         entries.append(MemoryEntry(
             id=r["id"],
             content=r["memory"],
             short_term=short_term,
             created_at=created_at,
+            dimension=dimension,
         ))
     return entries

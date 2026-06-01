@@ -31,7 +31,7 @@ def _make_message(
     guild_id: int = 12345,
     author_id: int = _ALLOWED_USER_ID,
 ) -> MagicMock:
-    """Return a minimal mock discord.Message."""
+    """Return a minimal mock guild discord.Message."""
     author = MagicMock(spec=discord.Member)
     author.bot = author_bot
     author.id = author_id
@@ -51,6 +51,20 @@ def _make_message(
     return message
 
 
+def _make_dm_message(
+    content: str = "hello",
+    author_id: int = _ALLOWED_USER_ID,
+) -> MagicMock:
+    """Return a minimal mock DM discord.Message (guild=None).
+
+    Reuses _make_message structure (discord.Member spec works for id/bot attrs)
+    then sets guild=None to simulate a DM.
+    """
+    msg = _make_message(content=content, author_id=author_id)
+    msg.guild = None
+    return msg
+
+
 def _make_bot(user_id: int = 11111) -> MagicMock:
     bot = MagicMock()
     bot.user = MagicMock()
@@ -65,13 +79,6 @@ def _make_settings() -> MagicMock:
     settings.discord_user_id = _ALLOWED_USER_ID
     settings.context_window_size = 12
     return settings
-
-
-@pytest.fixture(autouse=True)
-def reset_message_counts():
-    handlers_mod._message_counts.clear()
-    yield
-    handlers_mod._message_counts.clear()
 
 
 def _close_coro(coro):
@@ -96,6 +103,30 @@ async def test_handle_message_ignores_bot_messages():
 @pytest.mark.asyncio
 async def test_handle_message_ignores_wrong_guild():
     msg = _make_message(guild_id=99999)
+    bot = _make_bot()
+    with patch("core.interfaces.discord.handlers.get_settings", return_value=_make_settings()):
+        await handle_message(bot, msg)
+    msg.channel.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_message_accepts_dm_from_allowed_user():
+    msg = _make_dm_message(author_id=_ALLOWED_USER_ID)
+    bot = _make_bot()
+    with (
+        patch("core.interfaces.discord.handlers.get_settings", return_value=_make_settings()),
+        patch("core.interfaces.discord.handlers.orchestrator.run", new=AsyncMock(return_value="hey!")),
+        patch("core.interfaces.discord.handlers._build_context", new=AsyncMock(return_value=[])),
+        patch("core.interfaces.discord.handlers.db.insert_episodic_message", new=AsyncMock()),
+        patch("core.interfaces.discord.handlers.asyncio.create_task", side_effect=_close_coro),
+    ):
+        await handle_message(bot, msg)
+    msg.channel.send.assert_called_once_with("hey!")
+
+
+@pytest.mark.asyncio
+async def test_handle_message_ignores_dm_from_wrong_user():
+    msg = _make_dm_message(author_id=55555)  # 55555 != _ALLOWED_USER_ID (99999)
     bot = _make_bot()
     with patch("core.interfaces.discord.handlers.get_settings", return_value=_make_settings()):
         await handle_message(bot, msg)
@@ -250,23 +281,7 @@ async def test_handle_message_inserts_assistant_reply():
 
 
 @pytest.mark.asyncio
-async def test_handle_message_increments_counter_per_turn():
-    bot = _make_bot()
-    with (
-        patch("core.interfaces.discord.handlers.get_settings", return_value=_make_settings()),
-        patch("core.interfaces.discord.handlers.orchestrator.run", new=AsyncMock(return_value="ok")),
-        patch("core.interfaces.discord.handlers._build_context", new=AsyncMock(return_value=[])),
-        patch("core.interfaces.discord.handlers.db.insert_episodic_message", new=AsyncMock()),
-        patch("core.interfaces.discord.handlers.asyncio.create_task", side_effect=_close_coro),
-    ):
-        await handle_message(bot, _make_message())
-        await handle_message(bot, _make_message())
-
-    assert handlers_mod._message_counts[str(_ALLOWED_USER_ID)] == 2
-
-
-@pytest.mark.asyncio
-async def test_handle_message_triggers_extraction_with_correct_count():
+async def test_handle_message_triggers_extraction():
     msg = _make_message()
     bot = _make_bot()
     mock_extract = AsyncMock()
@@ -281,7 +296,7 @@ async def test_handle_message_triggers_extraction_with_correct_count():
         await handle_message(bot, msg)
 
     mock_ct.assert_called_once()
-    mock_extract.assert_called_once_with(bot.pool, str(_ALLOWED_USER_ID), 1)
+    mock_extract.assert_called_once_with(bot.pool, str(_ALLOWED_USER_ID))
 
 
 @pytest.mark.asyncio

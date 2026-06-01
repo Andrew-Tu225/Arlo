@@ -117,3 +117,34 @@ class TestUserProfile:
         )
         summary = UserProfile(user_id="u1", facts=facts).summary()
         assert "\n\n" in summary
+
+    def test_summary_groups_by_dimension_attribute(self):
+        def _dim_entry(content: str, dimension: str) -> MemoryEntry:
+            return MemoryEntry(id="x", content=content, short_term=False,
+                               created_at=_NOW, dimension=dimension)
+
+        facts = (
+            _dim_entry("loves hiking", "hobby"),
+            _dim_entry("plays piano", "hobby"),
+            _dim_entry("software developer", "work"),
+        )
+        summary = UserProfile(user_id="u1", facts=facts).summary()
+        assert "**Hobby**" in summary
+        assert "**Work**" in summary
+        assert "- loves hiking" in summary
+        assert "- plays piano" in summary
+        assert "- software developer" in summary
+
+    def test_summary_dimension_attribute_takes_precedence_over_content_split(self):
+        entry = MemoryEntry(id="x", content="raw mem0 sentence", short_term=False,
+                            created_at=_NOW, dimension="goal")
+        summary = UserProfile(user_id="u1", facts=(entry,)).summary()
+        assert "**Goal**" in summary
+        assert "- raw mem0 sentence" in summary
+
+    def test_summary_ungrouped_facts_go_to_other(self):
+        entry = self._entry("some random fact with no dimension")
+        summary = UserProfile(user_id="u1", facts=(entry,)).summary()
+        assert "**Other**" in summary
+        assert "some random fact with no dimension" in summary
+

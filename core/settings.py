@@ -1,6 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
+import pytz
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -27,12 +28,17 @@ class Settings(BaseSettings):
     discord_guild_id: int
     discord_user_id: int
 
+    # Proactive morning message(default)
+    digest_time: str = "09:00"
+    digest_timezone: str = "America/Toronto"
+
     # App config
     environment: Literal["development", "production"] = "development"
     log_level: Literal["debug", "info", "warning", "error"] = "info"
+    context_window_size: int = 12
     profile_extraction_interval: int = 10
     max_react_iterations: int = 8
-    context_window_size: int = 12
+    task_token_budget: int = 8000
 
     @model_validator(mode="after")
     def check_llm_key(self) -> "Settings":
@@ -40,6 +46,17 @@ class Settings(BaseSettings):
             raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
         if self.llm_provider == "openrouter" and not self.openrouter_api_key:
             raise ValueError("OPENROUTER_API_KEY is required when LLM_PROVIDER=openrouter")
+        return self
+
+    @model_validator(mode="after")
+    def check_digest_timezone(self) -> "Settings":
+        try:
+            pytz.timezone(self.digest_timezone)
+        except pytz.exceptions.UnknownTimeZoneError:
+            raise ValueError(
+                f"DIGEST_TIMEZONE={self.digest_timezone!r} is not a valid IANA timezone. "
+                "Examples: America/Toronto, Europe/London, Asia/Tokyo"
+            )
         return self
 
 

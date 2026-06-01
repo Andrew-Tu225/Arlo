@@ -3,7 +3,8 @@
 on_message pipeline:
   1. Filter gate — drop silently if any condition matches:
        - message.author is a bot
-       - message.guild.id != DISCORD_GUILD_ID
+       - message is from a guild other than DISCORD_GUILD_ID
+         (DMs pass — message.guild is None for DMs, so the guild check is skipped)
        - message.author.id != DISCORD_USER_ID  (single-user enforcement)
        - message.content is empty
   2. Show typing indicator.
@@ -15,6 +16,8 @@ on_message pipeline:
   6. Send reply (plain text, truncated to 2000 chars if needed).
   7. Insert assistant reply into episodic_messages (awaited before extraction).
   8. Trigger background profile extraction via asyncio.create_task (non-blocking).
+     Extraction fires when the DB count of user messages is divisible by
+     PROFILE_EXTRACTION_INTERVAL — no in-memory counter, so restarts are safe.
 
 Graceful degradation: if bot.pool is None (pool not yet initialised at startup),
 steps 3, 4, 7, and 8 are skipped — context is empty, reply is still sent.
@@ -37,7 +40,6 @@ from core.settings import get_settings
 logger = logging.getLogger(__name__)
 
 _MAX_DISCORD_LENGTH = 2000
-_message_counts: dict[str, int] = {}
 
 
 async def _build_context(
@@ -66,7 +68,8 @@ async def handle_message(bot: commands.Bot, message: discord.Message) -> None:
     # Filter gate
     if message.author.bot:
         return
-    if message.guild is None or message.guild.id != get_settings().discord_guild_id:
+    # check guild id match if exists, otherwise(from DM(no guild id)), pass through without being blocked
+    if message.guild is not None and message.guild.id != get_settings().discord_guild_id:
         return
     if message.author.id != get_settings().discord_user_id:
         return
@@ -102,10 +105,7 @@ async def handle_message(bot: commands.Bot, message: discord.Message) -> None:
                 await db.insert_episodic_message(
                     pool, user_id=user_id, role="assistant", content=response
                 )
-                _message_counts[user_id] = _message_counts.get(user_id, 0) + 1
-                asyncio.create_task(
-                    extractor.maybe_extract(pool, user_id, _message_counts[user_id])
-                )
+                asyncio.create_task(extractor.maybe_extract(pool, user_id))
         except Exception:
             logger.exception("Agent pipeline failed for message from %s", message.author)
             await message.channel.send("Something went wrong — try again.")
