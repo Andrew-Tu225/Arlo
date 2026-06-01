@@ -50,11 +50,12 @@ class TestIntervalGate:
         pool = MagicMock()
         with (
             patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=7),
             patch(
                 "core.memory.extractor.db.get_recent_messages", new_callable=AsyncMock
             ) as mock_db,
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=7)
+            await extractor.maybe_extract(pool, "u1")
         mock_db.assert_not_called()
 
     @pytest.mark.asyncio
@@ -62,6 +63,7 @@ class TestIntervalGate:
         pool = MagicMock()
         with (
             patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
             patch(
                 "core.memory.extractor.db.get_recent_messages",
                 new_callable=AsyncMock,
@@ -70,14 +72,27 @@ class TestIntervalGate:
             patch("core.memory.extractor.llm.get_client", return_value=_make_client()),
             patch("core.memory.extractor.store.add", new_callable=AsyncMock),
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=10)
+            await extractor.maybe_extract(pool, "u1")
 
     @pytest.mark.asyncio
     async def test_skips_when_pool_is_none(self):
         with patch(
             "core.memory.extractor.db.get_recent_messages", new_callable=AsyncMock
         ) as mock_db:
-            await extractor.maybe_extract(None, "u1", message_count=10)
+            await extractor.maybe_extract(None, "u1")
+        mock_db.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_count_is_zero(self):
+        pool = MagicMock()
+        with (
+            patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=0),
+            patch(
+                "core.memory.extractor.db.get_recent_messages", new_callable=AsyncMock
+            ) as mock_db,
+        ):
+            await extractor.maybe_extract(pool, "u1")
         mock_db.assert_not_called()
 
 
@@ -88,6 +103,7 @@ class TestMessageFetching:
         settings = _make_settings(interval=10)
         with (
             patch("core.memory.extractor.get_settings", return_value=settings),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
             patch(
                 "core.memory.extractor.db.get_recent_messages",
                 new_callable=AsyncMock,
@@ -96,7 +112,7 @@ class TestMessageFetching:
             patch("core.memory.extractor.llm.get_client", return_value=_make_client()),
             patch("core.memory.extractor.store.add", new_callable=AsyncMock),
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=10)
+            await extractor.maybe_extract(pool, "u1")
         mock_db.assert_called_once_with(pool, user_id="u1", n=10)
 
     @pytest.mark.asyncio
@@ -105,6 +121,7 @@ class TestMessageFetching:
         client = _make_client()
         with (
             patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
             patch(
                 "core.memory.extractor.db.get_recent_messages",
                 new_callable=AsyncMock,
@@ -113,7 +130,7 @@ class TestMessageFetching:
             patch("core.memory.extractor.llm.get_client", return_value=client),
             patch("core.memory.extractor.store.add", new_callable=AsyncMock),
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=10)
+            await extractor.maybe_extract(pool, "u1")
         client.chat.completions.create.assert_not_called()
 
 
@@ -128,6 +145,7 @@ class TestFactExtraction:
         ]
         with (
             patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
             patch(
                 "core.memory.extractor.db.get_recent_messages",
                 new_callable=AsyncMock,
@@ -136,7 +154,7 @@ class TestFactExtraction:
             patch("core.memory.extractor.llm.get_client", return_value=_make_client(facts)),
             patch("core.memory.extractor.store.add", new_callable=AsyncMock) as mock_add,
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=10)
+            await extractor.maybe_extract(pool, "u1")
         assert mock_add.call_count == 2
 
     @pytest.mark.asyncio
@@ -146,6 +164,7 @@ class TestFactExtraction:
         facts = [{"dimension": "diet", "value": "vegetarian", "is_short_term": False}]
         with (
             patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
             patch(
                 "core.memory.extractor.db.get_recent_messages",
                 new_callable=AsyncMock,
@@ -154,7 +173,7 @@ class TestFactExtraction:
             patch("core.memory.extractor.llm.get_client", return_value=_make_client(facts)),
             patch("core.memory.extractor.store.add", new_callable=AsyncMock) as mock_add,
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=10)
+            await extractor.maybe_extract(pool, "u1")
         assert mock_add.call_args.args[0] == "diet: vegetarian"
 
     @pytest.mark.asyncio
@@ -164,6 +183,7 @@ class TestFactExtraction:
         facts = [{"dimension": "location", "value": "in Tokyo this week", "is_short_term": True}]
         with (
             patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
             patch(
                 "core.memory.extractor.db.get_recent_messages",
                 new_callable=AsyncMock,
@@ -172,7 +192,7 @@ class TestFactExtraction:
             patch("core.memory.extractor.llm.get_client", return_value=_make_client(facts)),
             patch("core.memory.extractor.store.add", new_callable=AsyncMock) as mock_add,
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=10)
+            await extractor.maybe_extract(pool, "u1")
         assert mock_add.call_args.kwargs["short_term"] is True
 
     @pytest.mark.asyncio
@@ -182,6 +202,7 @@ class TestFactExtraction:
         facts = [{"dimension": "diet", "value": "vegetarian", "is_short_term": False}]
         with (
             patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
             patch(
                 "core.memory.extractor.db.get_recent_messages",
                 new_callable=AsyncMock,
@@ -190,7 +211,7 @@ class TestFactExtraction:
             patch("core.memory.extractor.llm.get_client", return_value=_make_client(facts)),
             patch("core.memory.extractor.store.add", new_callable=AsyncMock) as mock_add,
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=10)
+            await extractor.maybe_extract(pool, "u1")
         assert mock_add.call_args.kwargs["short_term"] is False
 
     @pytest.mark.asyncio
@@ -199,6 +220,7 @@ class TestFactExtraction:
         messages = [_make_message("user", "Hello there")]
         with (
             patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
             patch(
                 "core.memory.extractor.db.get_recent_messages",
                 new_callable=AsyncMock,
@@ -207,7 +229,7 @@ class TestFactExtraction:
             patch("core.memory.extractor.llm.get_client", return_value=_make_client([])),
             patch("core.memory.extractor.store.add", new_callable=AsyncMock) as mock_add,
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=10)
+            await extractor.maybe_extract(pool, "u1")
         mock_add.assert_not_called()
 
 
@@ -217,6 +239,7 @@ class TestErrorSwallowing:
         pool = MagicMock()
         with (
             patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
             patch(
                 "core.memory.extractor.db.get_recent_messages",
                 new_callable=AsyncMock,
@@ -224,7 +247,7 @@ class TestErrorSwallowing:
             ),
             patch("core.memory.extractor.store.add", new_callable=AsyncMock),
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=10)
+            await extractor.maybe_extract(pool, "u1")
 
     @pytest.mark.asyncio
     async def test_swallows_llm_exception(self):
@@ -234,6 +257,7 @@ class TestErrorSwallowing:
         bad_client.chat.completions.create = AsyncMock(side_effect=RuntimeError("LLM down"))
         with (
             patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
             patch(
                 "core.memory.extractor.db.get_recent_messages",
                 new_callable=AsyncMock,
@@ -242,7 +266,7 @@ class TestErrorSwallowing:
             patch("core.memory.extractor.llm.get_client", return_value=bad_client),
             patch("core.memory.extractor.store.add", new_callable=AsyncMock),
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=10)
+            await extractor.maybe_extract(pool, "u1")
 
     @pytest.mark.asyncio
     async def test_swallows_store_exception(self):
@@ -251,6 +275,7 @@ class TestErrorSwallowing:
         facts = [{"dimension": "diet", "value": "vegetarian", "is_short_term": False}]
         with (
             patch("core.memory.extractor.get_settings", return_value=_make_settings(10)),
+            patch("core.memory.extractor.db.count_user_messages", new_callable=AsyncMock, return_value=10),
             patch(
                 "core.memory.extractor.db.get_recent_messages",
                 new_callable=AsyncMock,
@@ -263,4 +288,4 @@ class TestErrorSwallowing:
                 side_effect=RuntimeError("mem0 down"),
             ),
         ):
-            await extractor.maybe_extract(pool, "u1", message_count=10)
+            await extractor.maybe_extract(pool, "u1")

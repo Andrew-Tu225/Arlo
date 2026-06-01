@@ -95,6 +95,19 @@ async def insert_episodic_message(
         )
 
 
+async def count_user_messages(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+) -> int:
+    """Return the total number of user-role messages stored for user_id."""
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM episodic_messages WHERE user_id = $1 AND role = 'user'",
+            user_id,
+        )
+
+
 async def get_recent_messages(
     pool: asyncpg.Pool,
     *,

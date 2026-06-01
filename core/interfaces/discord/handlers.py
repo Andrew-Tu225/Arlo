@@ -16,6 +16,8 @@ on_message pipeline:
   6. Send reply (plain text, truncated to 2000 chars if needed).
   7. Insert assistant reply into episodic_messages (awaited before extraction).
   8. Trigger background profile extraction via asyncio.create_task (non-blocking).
+     Extraction fires when the DB count of user messages is divisible by
+     PROFILE_EXTRACTION_INTERVAL — no in-memory counter, so restarts are safe.
 
 Graceful degradation: if bot.pool is None (pool not yet initialised at startup),
 steps 3, 4, 7, and 8 are skipped — context is empty, reply is still sent.
@@ -38,7 +40,6 @@ from core.settings import get_settings
 logger = logging.getLogger(__name__)
 
 _MAX_DISCORD_LENGTH = 2000
-_message_counts: dict[str, int] = {}
 
 
 async def _build_context(
@@ -104,10 +105,7 @@ async def handle_message(bot: commands.Bot, message: discord.Message) -> None:
                 await db.insert_episodic_message(
                     pool, user_id=user_id, role="assistant", content=response
                 )
-                _message_counts[user_id] = _message_counts.get(user_id, 0) + 1
-                asyncio.create_task(
-                    extractor.maybe_extract(pool, user_id, _message_counts[user_id])
-                )
+                asyncio.create_task(extractor.maybe_extract(pool, user_id))
         except Exception:
             logger.exception("Agent pipeline failed for message from %s", message.author)
             await message.channel.send("Something went wrong — try again.")

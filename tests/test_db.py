@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from core.db import (
+    count_user_messages,
     delete_schedule,
     get_channel_by_discord_id,
     get_enabled_channels,
@@ -134,6 +135,27 @@ class TestGetRecentMessages:
         await get_recent_messages(pool, user_id="u1", n=7)
         args = tuple(conn.fetch.call_args.args) + tuple(conn.fetch.call_args.kwargs.values())
         assert 7 in args
+
+
+class TestCountUserMessages:
+    @pytest.mark.asyncio
+    async def test_returns_count(self):
+        pool, conn = _make_pool(fetchval=5)
+        result = await count_user_messages(pool, user_id="u1")
+        assert result == 5
+
+    @pytest.mark.asyncio
+    async def test_passes_user_id(self):
+        pool, conn = _make_pool(fetchval=0)
+        await count_user_messages(pool, user_id="u42")
+        assert "u42" in conn.fetchval.call_args.args
+
+    @pytest.mark.asyncio
+    async def test_counts_only_user_role(self):
+        pool, conn = _make_pool(fetchval=3)
+        await count_user_messages(pool, user_id="u1")
+        query = conn.fetchval.call_args.args[0]
+        assert "role" in query.lower() and "user" in query.lower()
 
 
 class TestPruneOldMessages:

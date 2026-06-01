@@ -103,12 +103,12 @@ async def _extract_facts(conversation: str) -> list[dict]:
 async def maybe_extract(
     pool: asyncpg.Pool | None,
     user_id: str,
-    message_count: int,
 ) -> None:
     if pool is None:
         return
     settings = get_settings()
-    if message_count % settings.profile_extraction_interval != 0:
+    count = await db.count_user_messages(pool, user_id=user_id)
+    if count == 0 or count % settings.profile_extraction_interval != 0:
         return
     try:
         messages = await db.get_recent_messages(

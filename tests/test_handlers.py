@@ -81,13 +81,6 @@ def _make_settings() -> MagicMock:
     return settings
 
 
-@pytest.fixture(autouse=True)
-def reset_message_counts():
-    handlers_mod._message_counts.clear()
-    yield
-    handlers_mod._message_counts.clear()
-
-
 def _close_coro(coro):
     """Side effect for create_task mock: close coroutine to avoid 'never awaited' warnings."""
     coro.close()
@@ -288,23 +281,7 @@ async def test_handle_message_inserts_assistant_reply():
 
 
 @pytest.mark.asyncio
-async def test_handle_message_increments_counter_per_turn():
-    bot = _make_bot()
-    with (
-        patch("core.interfaces.discord.handlers.get_settings", return_value=_make_settings()),
-        patch("core.interfaces.discord.handlers.orchestrator.run", new=AsyncMock(return_value="ok")),
-        patch("core.interfaces.discord.handlers._build_context", new=AsyncMock(return_value=[])),
-        patch("core.interfaces.discord.handlers.db.insert_episodic_message", new=AsyncMock()),
-        patch("core.interfaces.discord.handlers.asyncio.create_task", side_effect=_close_coro),
-    ):
-        await handle_message(bot, _make_message())
-        await handle_message(bot, _make_message())
-
-    assert handlers_mod._message_counts[str(_ALLOWED_USER_ID)] == 2
-
-
-@pytest.mark.asyncio
-async def test_handle_message_triggers_extraction_with_correct_count():
+async def test_handle_message_triggers_extraction():
     msg = _make_message()
     bot = _make_bot()
     mock_extract = AsyncMock()
@@ -319,7 +296,7 @@ async def test_handle_message_triggers_extraction_with_correct_count():
         await handle_message(bot, msg)
 
     mock_ct.assert_called_once()
-    mock_extract.assert_called_once_with(bot.pool, str(_ALLOWED_USER_ID), 1)
+    mock_extract.assert_called_once_with(bot.pool, str(_ALLOWED_USER_ID))
 
 
 @pytest.mark.asyncio
