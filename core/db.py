@@ -198,6 +198,29 @@ async def insert_schedule(
     return row["id"]
 
 
+async def get_schedule_by_name(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    name: str,
+) -> dict | None:
+    """Return the schedule row for (user_id, name), or None."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, name, task, discord_channel_id, channel_topic,
+                   cron_schedule, poll_interval_secs, last_sent_at, enabled, created_at
+            FROM schedules
+            WHERE user_id = $1 AND name = $2
+            """,
+            user_id,
+            name,
+        )
+    if not rows:
+        return None
+    return {k: rows[0][k] for k in _SCHEDULE_COLS}
+
+
 async def get_schedule(pool: asyncpg.Pool, *, schedule_id: int) -> dict | None:
     """Return the schedule row for the given id, or None."""
     async with pool.acquire() as conn:
@@ -213,6 +236,22 @@ async def get_schedule(pool: asyncpg.Pool, *, schedule_id: int) -> dict | None:
     if not rows:
         return None
     return {k: rows[0][k] for k in _SCHEDULE_COLS}
+
+
+async def list_schedules_for_user(pool: asyncpg.Pool, *, user_id: str) -> list[dict]:
+    """Return all schedules for user_id, ordered by id."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, name, task, discord_channel_id, channel_topic,
+                   cron_schedule, poll_interval_secs, last_sent_at, enabled, created_at
+            FROM schedules
+            WHERE user_id = $1
+            ORDER BY id ASC
+            """,
+            user_id,
+        )
+    return [{k: row[k] for k in _SCHEDULE_COLS} for row in rows]
 
 
 async def get_enabled_schedules(pool: asyncpg.Pool, *, user_id: str) -> list[dict]:

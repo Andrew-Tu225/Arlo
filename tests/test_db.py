@@ -13,6 +13,8 @@ from core.db import (
     get_enabled_schedules,
     get_recent_messages,
     get_schedule,
+    get_schedule_by_name,
+    list_schedules_for_user,
     init_tables,
     insert_channel,
     insert_episodic_message,
@@ -181,13 +183,14 @@ def _make_schedule_record(
     id_=1, user_id="u1", name="morning-proactive",
     task="Morning task", discord_channel_id=None,
     channel_topic=None, cron_schedule="0 9 * * *",
+    enabled=True,
 ):
     rec = MagicMock()
     rec.__getitem__ = lambda self, k: {
         "id": id_, "user_id": user_id, "name": name, "task": task,
         "discord_channel_id": discord_channel_id, "channel_topic": channel_topic,
         "cron_schedule": cron_schedule, "poll_interval_secs": None,
-        "last_sent_at": None, "enabled": True, "created_at": _NOW,
+        "last_sent_at": None, "enabled": enabled, "created_at": _NOW,
     }[k]
     return rec
 
@@ -265,6 +268,38 @@ class TestGetSchedule:
         pool, conn = _make_pool(fetch=[rec])
         result = await get_schedule(pool, schedule_id=1)
         assert result["discord_channel_id"] == "111"
+
+
+class TestGetScheduleByName:
+    @pytest.mark.asyncio
+    async def test_returns_none_when_not_found(self):
+        pool, conn = _make_pool(fetch=[])
+        result = await get_schedule_by_name(pool, user_id="u1", name="missing")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_row_when_found(self):
+        rec = _make_schedule_record()
+        pool, conn = _make_pool(fetch=[rec])
+        result = await get_schedule_by_name(pool, user_id="u1", name="morning-proactive")
+        assert result is not None
+        assert result["name"] == "morning-proactive"
+
+
+class TestListSchedulesForUser:
+    @pytest.mark.asyncio
+    async def test_returns_all_schedules_including_disabled(self):
+        rec = _make_schedule_record(enabled=False)
+        pool, conn = _make_pool(fetch=[rec])
+        result = await list_schedules_for_user(pool, user_id="u1")
+        assert len(result) == 1
+        assert result[0]["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_passes_user_id(self):
+        pool, conn = _make_pool(fetch=[])
+        await list_schedules_for_user(pool, user_id="u42")
+        assert "u42" in conn.fetch.call_args.args
 
 
 class TestGetEnabledSchedules:

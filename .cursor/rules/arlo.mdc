@@ -1,0 +1,30 @@
+---
+description: Arlo Discord companion bot — core conventions and build state
+alwaysApply: true
+---
+
+# Arlo (Cursor)
+
+Persistent single-user Discord companion: mem0 + PostgreSQL, LangGraph agent, APScheduler proactive DMs.
+
+**Full context:** `AGENTS.md` (status + roadmap). **Architecture:** `docs/architecture.md`. **Claude parity:** `CLAUDE.md`.
+
+## Build state
+
+- Phases 1–3 shipped: bot, memory, `schedules`/digest, Tavily search.
+- **Phase 4 next:** ReAct tools in `orchestrator.py`, implement `read_url`, schedule write tools — not done yet.
+- `orchestrator.py` is still a single `chat` node (no tool loop).
+- No `/digest` command; proactive jobs live in `schedules` table.
+
+## Non-negotiables
+
+- No classifier/planner LLM calls; no in-place mutation.
+- Context from `episodic_messages`, not Discord API history.
+- `DISCORD_USER_ID` filter on every message; validate URLs before Jina fetch.
+- Background memory extraction only (`asyncio.create_task`).
+- One-line commit messages; ≥80% `core` test coverage target.
+- Self-hosted mem0 — no mem0 cloud API key.
+
+## Before editing
+
+Check `.claude/session/Arlo-implementation-plan.md` for the active phase scope.
