@@ -5,6 +5,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langgraph.types import Command
 from openai.types.chat import ChatCompletionMessageParam
 
 from core.agent.react import (
@@ -44,9 +45,6 @@ def _config(
     return ReactGraphConfig(
         build_system_prompt=lambda _state: "You are Arlo.",
         tool_schemas=schemas,
-        tool_context_factory=lambda state: ToolContext(
-            user_id=state.get("user_id") or "",
-        ),
         max_react_iterations=max_iterations,
         task_token_budget=token_budget,
     )
@@ -205,7 +203,7 @@ async def test_empty_assistant_content_uses_llm_fallback():
 async def test_tool_executor_appends_tool_messages():
     tool_calls = [_tool_call()]
 
-    async def fake_invoke(name: str, args: dict[str, Any], ctx: ToolContext) -> str:
+    async def fake_invoke(name: str, args: dict[str, Any], ctx: ToolContext, tool_call_id: str = "") -> str:
         return "tool-observation"
 
     client = MagicMock()
@@ -232,3 +230,162 @@ async def test_tool_executor_appends_tool_messages():
     tool_msg = next(m for m in second_call_messages if m["role"] == "tool")
     assert tool_msg["content"] == "tool-observation"
     assert tool_msg["tool_call_id"] == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_medium_risk_tool_triggers_interrupt_and_resumes():
+    from langgraph.types import Command
+    tool_calls = [_tool_call(
+        name="create_schedule",
+        arguments={"name": "gym", "task": "remind me", "cron_schedule": "07:00"}
+    )]
+
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(
+        side_effect=[
+            _completion(content=None, tool_calls=tool_calls),
+            _completion(content="Gym schedule created!"),
+        ],
+    )
+    
+    # Custom config with create_schedule tool schema
+    config = _config(tool_schemas=[
+        {
+            "type": "function",
+            "function": {
+                "name": "create_schedule",
+                "description": "create",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "task": {"type": "string"},
+                        "cron_schedule": {"type": "string"},
+                    },
+                    "required": ["name", "task", "cron_schedule"],
+                },
+            },
+        }
+    ])
+    graph = build_react_graph(config)
+    thread_id = "test-thread-interrupt"
+
+    # Mock approval request and schedule tool execution
+    mock_approval = AsyncMock(return_value="Awaiting confirmation...")
+    mock_create_schedule = AsyncMock(return_value="Created schedule gym")
+
+    # Step 1: Run graph, should hit interrupt and return approval message
+    with (
+        patch("core.agent.react.get_client", return_value=client),
+        patch("core.agent.actions.request_medium_risk_approval", new=mock_approval),
+        patch("core.agent.tools.schedules.create_schedule", new=mock_create_schedule),
+    ):
+        result = await run_react_graph(
+            graph,
+            messages=_USER_MSG,
+            user_id="u1",
+            thread_id=thread_id,
+            pool=MagicMock(),
+            bot=MagicMock(),
+        )
+
+    assert result == "Awaiting confirmation..."
+    mock_approval.assert_awaited_once()
+
+    # Step 2: Resume graph with Command(resume=True) -> Executes tool and gets final response
+    with (
+        patch("core.agent.react.get_client", return_value=client),
+        patch("core.agent.actions.request_medium_risk_approval", new=mock_approval),
+        patch("core.agent.tools.schedules.create_schedule", new=mock_create_schedule),
+    ):
+        result2 = await run_react_graph(
+            graph,
+            messages=None,
+            user_id="u1",
+            thread_id=thread_id,
+            resume_command=Command(resume=True),
+            pool=MagicMock(),
+            bot=MagicMock(),
+        )
+
+    assert result2 == "Gym schedule created!"
+    mock_create_schedule.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_medium_risk_tool_cancels_when_rejected():
+    tool_calls = [_tool_call(
+        name="create_schedule",
+        arguments={"name": "gym", "task": "remind me", "cron_schedule": "07:00"}
+    )]
+
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(
+        side_effect=[
+            _completion(content=None, tool_calls=tool_calls),
+            _completion(content="No action was taken."),
+        ],
+    )
+    
+    config = _config(tool_schemas=[
+        {
+            "type": "function",
+            "function": {
+                "name": "create_schedule",
+                "description": "create",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "task": {"type": "string"},
+                        "cron_schedule": {"type": "string"},
+                    },
+                    "required": ["name", "task", "cron_schedule"],
+                },
+            },
+        }
+    ])
+    graph = build_react_graph(config)
+    thread_id = "test-thread-cancel"
+
+    mock_approval = AsyncMock(return_value="Awaiting confirmation...")
+    mock_create_schedule = AsyncMock()
+
+    # Step 1: Run graph to trigger interrupt
+    with (
+        patch("core.agent.react.get_client", return_value=client),
+        patch("core.agent.actions.request_medium_risk_approval", new=mock_approval),
+        patch("core.agent.tools.schedules.create_schedule", new=mock_create_schedule),
+    ):
+        result = await run_react_graph(
+            graph,
+            messages=_USER_MSG,
+            user_id="u1",
+            thread_id=thread_id,
+            pool=MagicMock(),
+            bot=MagicMock(),
+        )
+
+    assert result == "Awaiting confirmation..."
+
+    # Step 2: Resume graph with Command(resume=False) -> tool rejected, no execution
+    with (
+        patch("core.agent.react.get_client", return_value=client),
+        patch("core.agent.actions.request_medium_risk_approval", new=mock_approval),
+        patch("core.agent.tools.schedules.create_schedule", new=mock_create_schedule),
+    ):
+        result2 = await run_react_graph(
+            graph,
+            messages=None,
+            user_id="u1",
+            thread_id=thread_id,
+            resume_command=Command(resume=False),
+            pool=MagicMock(),
+            bot=MagicMock(),
+        )
+
+    assert result2 == "No action was taken."
+    mock_create_schedule.assert_not_awaited()
+
+
+

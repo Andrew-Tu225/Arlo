@@ -21,6 +21,7 @@ class TestToolMetadata:
             "remember",
             "list_schedules",
             "create_schedule",
+            "edit_schedule",
             "delete_schedule",
         }
 
@@ -104,7 +105,21 @@ class TestInvokeTool:
         assert "Created" in result
         mock_create.assert_awaited_once()
 
-    async def test_delete_schedule_delegates_name(self):
+    async def test_edit_schedule_delegates(self):
+        ctx = ToolContext(user_id="u1", pool=MagicMock(), bot=MagicMock())
+        with patch(
+            "core.agent.tools.schedules.edit_schedule",
+            new=AsyncMock(return_value="Updated schedule 'gym'."),
+        ) as mock_edit:
+            result = await invoke_tool(
+                "edit_schedule",
+                {"name": "gym", "cron_schedule": "08:00"},
+                ctx,
+            )
+        assert "Updated" in result
+        mock_edit.assert_awaited_once()
+
+    async def test_delete_schedule_delegates(self):
         ctx = ToolContext(user_id="u1", pool=MagicMock())
         with patch(
             "core.agent.tools.schedules.delete_schedule",

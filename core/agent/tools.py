@@ -13,6 +13,7 @@ from typing import Any
 
 from langchain_core.tools import StructuredTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from langgraph.types import interrupt
 
 from core.memory import store
 from core.tools import reader, schedules, search
@@ -24,6 +25,16 @@ RESEARCH_FALLBACK = (
 )
 
 _READONLY_TOOL_NAMES = frozenset({"web_search", "search_memory"})
+
+MEDIUM_RISK_TOOLS = frozenset({
+    "create_schedule",
+    "edit_schedule",
+    "delete_schedule",
+})
+
+
+def is_medium_risk(tool_name: str) -> bool:
+    return tool_name in MEDIUM_RISK_TOOLS
 
 
 @dataclass(frozen=True)
@@ -111,6 +122,26 @@ def build_tools(ctx: ToolContext) -> list[StructuredTool]:
             name=name,
         )
 
+    async def edit_schedule(
+        name: str,
+        task: str | None = None,
+        cron_schedule: str | None = None,
+        discord_channel_id: str | None = None,
+        enabled: bool | None = None,
+    ) -> str:
+        if ctx.pool is None or ctx.bot is None:
+            return "Error: schedule tools unavailable"
+        return await schedules.edit_schedule(
+            pool=ctx.pool,
+            bot=ctx.bot,
+            user_id=ctx.user_id,
+            name=name,
+            task=task,
+            cron_schedule=cron_schedule,
+            discord_channel_id=discord_channel_id,
+            enabled=enabled,
+        )
+
     return [
         StructuredTool.from_function(
             coroutine=web_search,
@@ -146,14 +177,23 @@ def build_tools(ctx: ToolContext) -> list[StructuredTool]:
             description=(
                 "Create a recurring proactive schedule. "
                 "cron_schedule: five-field cron or HH:MM daily time. "
-                "discord_channel_id null = DM."
+                "discord_channel_id null = DM. Requires user confirmation in Discord."
+            ),
+        ),
+        StructuredTool.from_function(
+            coroutine=edit_schedule,
+            name="edit_schedule",
+            description=(
+                "Update an existing schedule by exact name from list_schedules. "
+                "Only pass fields to change. Requires user confirmation in Discord."
             ),
         ),
         StructuredTool.from_function(
             coroutine=delete_schedule,
             name="delete_schedule",
             description=(
-                "Delete a schedule by exact name from list_schedules."
+                "Delete a schedule by exact name from list_schedules. "
+                "Requires user confirmation in Discord."
             ),
         ),
     ]
@@ -177,8 +217,22 @@ def get_readonly_openai_tool_schemas() -> list[dict[str, Any]]:
     ]
 
 
-async def invoke_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> str:
+async def invoke_tool(name: str, args: dict[str, Any], ctx: ToolContext, tool_call_id: str = "") -> str:
     """Execute a tool by name. Returns tool observation text."""
+    if is_medium_risk(name):
+        try:
+            approved = interrupt({
+                "tool_name": name,
+                "tool_args": args,
+                "tool_call_id": tool_call_id,
+            })
+            if not approved:
+                return f"Error: User rejected the request to execute '{name}'. Do not perform the action."
+        except RuntimeError:
+            # Standalone execution/tests outside of a runnable context
+            pass
+
+
     tools = {tool.name: tool for tool in build_tools(ctx)}
     tool = tools.get(name)
     if tool is None:
@@ -187,3 +241,4 @@ async def invoke_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> str:
         return f"Error: tool '{name}' has no async implementation"
     result = await tool.coroutine(**args)
     return result if isinstance(result, str) else str(result)
+

@@ -17,14 +17,18 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+
 from openai.types.chat import ChatCompletionMessageParam
 
 from core.agent.tools import RESEARCH_FALLBACK, ToolContext, invoke_tool
 from core.llm import get_client, get_default_model
 
 logger = logging.getLogger(__name__)
+
+checkpointer = MemorySaver()
 
 LLM_ERROR_FALLBACK = "Something went sideways on my end — can you try again?"
 
@@ -33,22 +37,19 @@ class ReActState(TypedDict, total=False):
     messages: list[ChatCompletionMessageParam]
     user_id: str | None
     discord_channel_id: str | None
-    response: str           #response message at the end
+    response: str       # the final response to be returned to the user
     iteration_count: int
     token_usage: int
 
 
 SystemPromptBuilder = Callable[[ReActState], str | Awaitable[str]]
-ToolContextFactory = Callable[[ReActState], ToolContext]
 
 
 @dataclass(frozen=True)
 class ReactGraphConfig:
     """Configuration for a compiled ReAct graph."""
-
     build_system_prompt: SystemPromptBuilder
     tool_schemas: list[dict[str, Any]]
-    tool_context_factory: ToolContextFactory
     max_react_iterations: int
     task_token_budget: int
     ceiling_fallback: str = RESEARCH_FALLBACK
@@ -64,19 +65,19 @@ def _last_assistant(
     return None
 
 
-def build_react_graph(config: ReactGraphConfig) -> CompiledStateGraph:
+def build_react_graph(graph_config: ReactGraphConfig) -> CompiledStateGraph:
     """Compile a ReAct graph: reason ↔ tools until reply or ceiling."""
 
     async def reason(state: ReActState) -> dict[str, Any]:
         iterations = state.get("iteration_count", 0)
         tokens = state.get("token_usage", 0)
         if (
-            iterations >= config.max_react_iterations
-            or tokens >= config.task_token_budget
+            iterations >= graph_config.max_react_iterations
+            or tokens >= graph_config.task_token_budget
         ):
-            return {"response": config.ceiling_fallback}
+            return {"response": graph_config.ceiling_fallback}
 
-        prompt = config.build_system_prompt(state)
+        prompt = graph_config.build_system_prompt(state)
         system_content = prompt if isinstance(prompt, str) else await prompt
         llm_messages: list[ChatCompletionMessageParam] = [
             {"role": "system", "content": system_content},
@@ -87,12 +88,12 @@ def build_react_graph(config: ReactGraphConfig) -> CompiledStateGraph:
             completion = await get_client().chat.completions.create(
                 model=get_default_model(),
                 messages=llm_messages,
-                tools=config.tool_schemas,
+                tools=graph_config.tool_schemas,
                 tool_choice="auto",
             )
         except Exception:
             logger.exception("LLM call failed in reason node")
-            return {"response": config.llm_error_fallback}
+            return {"response": graph_config.llm_error_fallback}
 
         choice = completion.choices[0].message
         assistant_message: ChatCompletionMessageParam = choice.model_dump(
@@ -105,11 +106,11 @@ def build_react_graph(config: ReactGraphConfig) -> CompiledStateGraph:
         new_messages = [*state.get("messages", []), assistant_message]
         new_token_usage = tokens + usage_delta
 
-        if new_token_usage >= config.task_token_budget:
+        if new_token_usage >= graph_config.task_token_budget:
             return {
                 "messages": new_messages,
                 "token_usage": new_token_usage,
-                "response": config.ceiling_fallback,
+                "response": graph_config.ceiling_fallback,
             }
 
         if assistant_message.get("tool_calls"):
@@ -123,18 +124,27 @@ def build_react_graph(config: ReactGraphConfig) -> CompiledStateGraph:
         return {
             "messages": new_messages,
             "token_usage": new_token_usage,
-            "response": text or config.llm_error_fallback,
+            "response": text or graph_config.llm_error_fallback,
         }
 
-    async def tools(state: ReActState) -> dict[str, Any]:
+    async def tools(state: ReActState, config: dict[str, Any]) -> dict[str, Any]:
         assistant = _last_assistant(state.get("messages", []))
         if assistant is None:
             return {
-                "response": config.llm_error_fallback,
+                "response": graph_config.llm_error_fallback,
                 "iteration_count": state.get("iteration_count", 0) + 1,
             }
 
-        ctx = config.tool_context_factory(state)
+        configurable = config.get("configurable", {})
+        pool = configurable.get("pool")
+        bot = configurable.get("bot")
+
+        ctx = ToolContext(
+            user_id=state.get("user_id") or "",
+            pool=pool,
+            bot=bot,
+            discord_channel_id=state.get("discord_channel_id"),
+        )
         tool_messages: list[ChatCompletionMessageParam] = []
 
         for call in assistant.get("tool_calls") or []:
@@ -148,7 +158,7 @@ def build_react_graph(config: ReactGraphConfig) -> CompiledStateGraph:
             if not isinstance(args, dict):
                 args = {}
 
-            observation = await invoke_tool(name, args, ctx)
+            observation = await invoke_tool(name, args, ctx, tool_call_id=call.get("id", ""))
             tool_messages.append(
                 {
                     "role": "tool",
@@ -180,25 +190,61 @@ def build_react_graph(config: ReactGraphConfig) -> CompiledStateGraph:
         {"tools": "tools", END: END},
     )
     graph.add_edge("tools", "reason")
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 async def run_react_graph(
     graph: CompiledStateGraph,
     *,
-    messages: list[ChatCompletionMessageParam],
+    messages: list[ChatCompletionMessageParam] | None = None,
     user_id: str | None = None,
+    pool: Any = None,
+    bot: Any = None,
     discord_channel_id: str | None = None,
     initial_response: str = "",
+    thread_id: str | None = None,
+    resume_command: Any = None,
 ) -> str:
     """Invoke a compiled ReAct graph and return the final response string."""
-    initial_state: ReActState = {
-        "messages": messages,
-        "user_id": user_id,
-        "discord_channel_id": discord_channel_id,
-        "response": initial_response,
-        "iteration_count": 0,
-        "token_usage": 0,
+    config = {
+        "configurable": {
+            "thread_id": thread_id or user_id or "default",
+            "pool": pool,
+            "bot": bot,
+        }
     }
-    result = await graph.ainvoke(initial_state)
-    return result.get("response") or LLM_ERROR_FALLBACK
+    
+    if resume_command is not None:
+        await graph.ainvoke(resume_command, config=config)
+    else:
+        initial_state: ReActState = {
+            "messages": messages or [],
+            "user_id": user_id,
+            "discord_channel_id": discord_channel_id,
+            "response": initial_response,
+            "iteration_count": 0,
+            "token_usage": 0,
+        }
+        await graph.ainvoke(initial_state, config=config)
+
+    state = await graph.aget_state(config)
+    if state.tasks and state.tasks[0].interrupts:
+        interrupt_val = state.tasks[0].interrupts[0].value
+        from core.agent import actions
+        ctx = ToolContext(
+            user_id=user_id or "",
+            pool=pool,
+            bot=bot,
+            discord_channel_id=discord_channel_id,
+        )
+        return await actions.request_medium_risk_approval(
+            tool_name=interrupt_val["tool_name"],
+            args=interrupt_val["tool_args"],
+            ctx=ctx,
+            tool_call_id=interrupt_val["tool_call_id"],
+            thread_id=thread_id or "default",
+        )
+
+    return state.values.get("response") or LLM_ERROR_FALLBACK
+
+
