@@ -82,6 +82,13 @@ class TestInitTables:
         combined = " ".join(str(c) for c in conn.execute.call_args_list)
         assert "arlo_channels" in combined
 
+    @pytest.mark.asyncio
+    async def test_creates_pending_actions_table(self):
+        pool, conn = _make_pool()
+        await init_tables(pool)
+        combined = " ".join(str(c) for c in conn.execute.call_args_list)
+        assert "pending_actions" in combined
+
 
 class TestInsertEpisodicMessage:
     @pytest.mark.asyncio

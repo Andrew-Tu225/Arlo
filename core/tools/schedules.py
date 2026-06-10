@@ -109,6 +109,100 @@ async def create_schedule(
     return f"Created schedule '{name}' (id={schedule_id})."
 
 
+async def edit_schedule(
+    *,
+    pool,
+    bot,
+    user_id: str,
+    name: str,
+    task: str | None = None,
+    cron_schedule: str | None = None,
+    discord_channel_id: str | None = None,
+    enabled: bool | None = None,
+) -> str:
+    """Update fields on an existing schedule by exact name."""
+    name = name.strip()
+    if not name:
+        return "Error: schedule name cannot be empty"
+
+    if all(
+        v is None
+        for v in (task, cron_schedule, discord_channel_id, enabled)
+    ):
+        return "Error: provide at least one field to update (task, cron_schedule, enabled)"
+
+    row = await db.get_schedule_by_name(pool, user_id=user_id, name=name)
+    if row is None:
+        return (
+            f"Error: no schedule named {name!r}. "
+            "Call list_schedules for exact names."
+        )
+
+    schedule_id = row["id"]
+    cron: str | None = None
+    if cron_schedule is not None:
+        try:
+            cron = parse_cron_schedule(cron_schedule)
+        except ValueError as exc:
+            return f"Error: {exc}"
+
+    task_update = task.strip() if task is not None else None
+    if task_update is not None and not task_update:
+        return "Error: task cannot be empty"
+
+    await db.update_schedule(
+        pool,
+        schedule_id=schedule_id,
+        task=task_update,
+        cron_schedule=cron,
+        discord_channel_id=discord_channel_id,
+        enabled=enabled,
+    )
+
+    if cron is not None:
+        settings = get_settings()
+        tz = pytz.timezone(settings.digest_timezone)
+        try:
+            trigger = CronTrigger.from_crontab(cron, timezone=tz)
+            scheduler.add_job(
+                run_schedule_job,
+                trigger,
+                id=f"schedule_{schedule_id}",
+                replace_existing=True,
+                misfire_grace_time=3600,
+                kwargs={"bot": bot, "pool": pool, "schedule_id": schedule_id},
+            )
+        except Exception as exc:
+            logger.exception("Failed to reschedule job for schedule %s", schedule_id)
+            return f"Error: invalid cron schedule ({exc})"
+
+    if enabled is False:
+        job_id = f"schedule_{schedule_id}"
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            logger.debug("No APScheduler job %s to remove", job_id)
+    elif enabled is True and cron is None and row.get("cron_schedule"):
+        settings = get_settings()
+        tz = pytz.timezone(settings.digest_timezone)
+        try:
+            trigger = CronTrigger.from_crontab(row["cron_schedule"], timezone=tz)
+            scheduler.add_job(
+                run_schedule_job,
+                trigger,
+                id=f"schedule_{schedule_id}",
+                replace_existing=True,
+                misfire_grace_time=3600,
+                kwargs={"bot": bot, "pool": pool, "schedule_id": schedule_id},
+            )
+        except Exception as exc:
+            logger.exception("Failed to re-enable job for schedule %s", schedule_id)
+            return f"Error: could not re-enable schedule ({exc})"
+
+    logger.info("Updated schedule_%s (%s)", schedule_id, name)
+    return f"Updated schedule '{name}'."
+
+
 async def delete_schedule(
     *,
     pool,

@@ -18,6 +18,9 @@ Tables managed here:
 
 from __future__ import annotations
 
+import json
+import logging
+
 import asyncpg
 
 from core.memory.models import EpisodicMessage
@@ -72,6 +75,20 @@ async def init_tables(pool: asyncpg.Pool) -> None:
                 UNIQUE (user_id, discord_channel_id)
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id              SERIAL PRIMARY KEY,
+                user_id         TEXT NOT NULL,
+                tool_name       TEXT NOT NULL,
+                tool_args       JSONB NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                discord_msg_id  TEXT,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                resolved_at     TIMESTAMPTZ,
+                agent_state     JSONB
+            )
+        """)
+        await conn.execute("ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS agent_state JSONB")
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +356,96 @@ async def update_schedule_last_sent(pool: asyncpg.Pool, *, schedule_id: int) -> 
         await conn.execute(
             "UPDATE schedules SET last_sent_at = now() WHERE id = $1",
             schedule_id,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pending actions (Phase 4 — medium-risk tool approval)
+# ---------------------------------------------------------------------------
+
+_PENDING_ACTION_COLS = (
+    "id", "user_id", "tool_name", "tool_args", "status",
+    "discord_msg_id", "created_at", "resolved_at", "agent_state",
+)
+
+
+async def insert_pending_action(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    tool_name: str,
+    tool_args: dict,
+    agent_state: dict | None = None,
+) -> int:
+    """Insert a pending medium-risk action and return its id."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO pending_actions (user_id, tool_name, tool_args, agent_state)
+            VALUES ($1, $2, $3::jsonb, $4::jsonb)
+            RETURNING id
+            """,
+            user_id,
+            tool_name,
+            json.dumps(tool_args),
+            json.dumps(agent_state) if agent_state is not None else None,
+        )
+    return row["id"]
+
+
+async def get_pending_action(
+    pool: asyncpg.Pool,
+    *,
+    pending_id: int,
+) -> dict | None:
+    """Return a pending_actions row by id, or None."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, tool_name, tool_args, status,
+                   discord_msg_id, created_at, resolved_at, agent_state
+            FROM pending_actions
+            WHERE id = $1
+            """,
+            pending_id,
+        )
+    if not rows:
+        return None
+    row = rows[0]
+    return {k: row[k] for k in _PENDING_ACTION_COLS}
+
+
+async def set_pending_action_discord_msg_id(
+    pool: asyncpg.Pool,
+    *,
+    pending_id: int,
+    discord_msg_id: str,
+) -> None:
+    """Store the Discord message id for the approval embed."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE pending_actions SET discord_msg_id = $2 WHERE id = $1",
+            pending_id,
+            discord_msg_id,
+        )
+
+
+async def resolve_pending_action(
+    pool: asyncpg.Pool,
+    *,
+    pending_id: int,
+    status: str,
+) -> None:
+    """Mark a pending action approved, rejected, or expired."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE pending_actions
+            SET status = $2, resolved_at = now()
+            WHERE id = $1
+            """,
+            pending_id,
+            status,
         )
 
 
