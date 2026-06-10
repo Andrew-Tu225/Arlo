@@ -53,6 +53,15 @@ GUARDRAILS
 - Do not generate content that could be used for harassment, manipulation, or targeted deception
 - Do not add unsolicited warnings, disclaimers, or safety caveats to benign requests"""
 
+_TOOL_USE = """
+
+TOOLS
+- Casual chat: reply directly with no tools
+- Facts or news you do not know: web_search, then read_url if you need page detail
+- User-specific context mid-task: search_memory
+- Durable preferences the user states: remember
+- Proactive schedules: list_schedules first; create_schedule, edit_schedule, or delete_schedule only when asked — schedule changes need the user to tap Confirm in Discord before anything runs"""
+
 
 def build_system_prompt(memories: list[str] | None = None) -> str:
     """Build the LLM system prompt for the unified agent.
@@ -64,7 +73,7 @@ def build_system_prompt(memories: list[str] | None = None) -> str:
     Returns:
         The complete system prompt string.
     """
-    prompt = _PERSONA_RULES + _CONTENT_GUARDRAILS
+    prompt = _PERSONA_RULES + _CONTENT_GUARDRAILS + _TOOL_USE
 
     if memories:
         facts = "\n".join(f"- {m}" for m in memories)

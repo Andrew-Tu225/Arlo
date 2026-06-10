@@ -94,14 +94,21 @@ async def handle_message(bot: commands.Bot, message: discord.Message) -> None:
                 )
 
             context = await _build_context(pool, user_id)
-            response = await orchestrator.run(context, user_id=user_id)
+            channel_id = str(message.channel.id) if message.channel else None
+            response = await orchestrator.run(
+                context,
+                user_id=user_id,
+                pool=pool,
+                bot=bot,
+                discord_channel_id=channel_id,
+            )
 
             if len(response) > _MAX_DISCORD_LENGTH:
                 response = response[: _MAX_DISCORD_LENGTH - 3] + "..."
 
             await message.channel.send(response)
 
-            if pool is not None:
+            if pool is not None and not response.startswith("Awaiting your confirmation"):
                 await db.insert_episodic_message(
                     pool, user_id=user_id, role="assistant", content=response
                 )

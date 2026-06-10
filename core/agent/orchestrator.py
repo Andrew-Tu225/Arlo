@@ -4,116 +4,133 @@ All message types (casual chat, task requests, memory updates) pass through
 this agent. The model decides what to do by which tools it calls — there is
 no separate classifier or planner call.
 
-Phase 1 graph shape (single chat node, no tools):
-  START ──► chat ──► END
+Graph shape (Phase 4):
+  START → reason ──┬──► tools → reason (loop)
+                   └──► END
 
-Phase 4 graph shape (tools added, no schema migration needed):
-  START ──► reason ──┬──► tool_executor ──► reason (loop)
-                     └──► END
+Medium-risk schedule writes (create, edit, delete) require Discord approval
+before execution — see core.agent.actions.
 
-State schema includes iteration_count and token_usage as placeholders so
-Phase 4 can wire the ReAct ceiling and token budget without restructuring state.
-
-Exit conditions (Phase 4, first one wins):
+Exit conditions (first one wins):
   - LLM returns no tool calls          → send response
   - MAX_REACT_ITERATIONS reached       → honest fallback (no hallucination)
   - TASK_TOKEN_BUDGET tokens consumed  → honest fallback
 """
 
-import logging
-from typing import TypedDict
+from __future__ import annotations
 
-from langgraph.graph import END, StateGraph
+import asyncio
+from typing import Any
+import uuid
+
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
 from openai.types.chat import ChatCompletionMessageParam
 
+from core import db
 from core.agent.persona import build_system_prompt
-from core.llm import get_client, get_default_model
-from core.memory import store
-
-logger = logging.getLogger(__name__)
+from core.agent.react import ReactGraphConfig, build_react_graph, run_react_graph
+from core.agent.tools import ToolContext, get_openai_tool_schemas
+from core.memory import extractor
+from core.settings import get_settings
 
 FALLBACK_RESPONSE = "Something went sideways on my end — can you try again?"
 
 
-class AgentState(TypedDict):
-    messages: list[ChatCompletionMessageParam]  # user/assistant dicts (system prepended inside node)
-    user_id: str | None  # Discord user ID; None in degraded/test mode (skips memory search)
-    response: str  # Final reply text sent to Discord
-    iteration_count: int  # Phase 1: always 0; Phase 4: incremented per ReAct loop
-    token_usage: int  # Phase 1: always 0; Phase 4: accumulated from response.usage
+def _build_config() -> ReactGraphConfig:
+    settings = get_settings()
+
+    def build_system_prompt_for_state(_state: dict[str, Any]) -> str:
+        return build_system_prompt()
+
+    return ReactGraphConfig(
+        build_system_prompt=build_system_prompt_for_state,
+        tool_schemas=get_openai_tool_schemas(),
+        max_react_iterations=settings.max_react_iterations,
+        task_token_budget=settings.task_token_budget,
+        llm_error_fallback=FALLBACK_RESPONSE,
+    )
 
 
-async def _chat_node(state: AgentState) -> dict[str, str]:
-    """Single chat node for Phase 1. Calls the LLM with the full message history.
-
-    Fetches relevant user memories from mem0 before the LLM call and injects
-    them into the system prompt. Degrades gracefully if mem0 is unavailable.
-    """
-    user_id = state["user_id"]
-    memories: list[str] = []
-
-    if user_id:
-        user_messages = [m for m in state["messages"] if m.get("role") == "user"]
-        if user_messages:
-            query = str(user_messages[-1].get("content", ""))
-            try:
-                memories = await store.search(query, user_id)
-            except Exception:
-                logger.exception("store.search failed; proceeding without memories")
-
-    system_message: ChatCompletionMessageParam = {
-        "role": "system",
-        "content": build_system_prompt(memories=memories or None),
-    }
-    messages = [system_message, *state["messages"]]
-
-    try:
-        result = await get_client().chat.completions.create(
-            model=get_default_model(),
-            messages=messages,
-        )
-        content = result.choices[0].message.content
-        return {"response": content if content else FALLBACK_RESPONSE}
-    except Exception:
-        logger.exception("LLM call failed in _chat_node")
-        return {"response": FALLBACK_RESPONSE}
-
-
-def _build_graph() -> CompiledStateGraph:
-    graph = StateGraph(AgentState)
-    graph.add_node("chat", _chat_node)
-    graph.set_entry_point("chat")
-    graph.add_edge("chat", END)
-    return graph.compile()
-
-
-# Compiled at import time — no lazy init needed and avoids blocking the event loop.
-_compiled_graph: CompiledStateGraph = _build_graph()
+_compiled_graph: CompiledStateGraph = build_react_graph(_build_config())
 
 
 async def run(
     messages: list[ChatCompletionMessageParam],
     *,
     user_id: str | None = None,
+    pool: Any = None,
+    bot: Any = None,
+    discord_channel_id: str | None = None,
 ) -> str:
     """Run the agent on a list of conversation messages.
 
     Args:
         messages: OpenAI-format dicts with "role" and "content" keys.
             Do not include a system message — the agent prepends it.
-        user_id: Discord user ID used to fetch relevant memories from mem0.
-            Pass None to skip memory injection (degraded/test mode).
+        user_id: Discord user ID for memory and schedule tools.
+        pool: asyncpg pool for schedule tools and pending_actions.
+        bot: discord.py Bot for schedule registration and approval UI.
+        discord_channel_id: Channel where the user message arrived (approval UI).
 
     Returns:
         The agent's reply as a plain string.
     """
-    initial_state: AgentState = {
-        "messages": messages,
-        "user_id": user_id,
-        "response": "",
-        "iteration_count": 0,
-        "token_usage": 0,
-    }
-    result = await _compiled_graph.ainvoke(initial_state)
-    return result["response"] or FALLBACK_RESPONSE
+    thread_id = str(uuid.uuid4())
+    return await run_react_graph(
+        _compiled_graph,
+        messages=messages,
+        user_id=user_id,
+        pool=pool,
+        bot=bot,
+        discord_channel_id=discord_channel_id,
+        thread_id=thread_id,
+    )
+
+
+async def resume(
+    thread_id: str,
+    approved: bool,
+    *,
+    user_id: str,
+    pool: Any = None,
+    bot: Any = None,
+    discord_channel_id: str | None = None,
+) -> str:
+    """Resume a paused agent execution thread and process the final response.
+
+    Args:
+        thread_id: The unique thread ID used when the graph was paused.
+        approved: Whether the human approved (True) or cancelled (False) the action.
+        user_id: Discord user ID for logging.
+        pool: asyncpg pool for episodic messages and extraction.
+        bot: discord.py Bot context.
+        discord_channel_id: Channel ID for context.
+
+    Returns:
+        The agent's reply as a plain string.
+    """
+    resume_command = Command(resume=approved)
+
+    response = await run_react_graph(
+        _compiled_graph,
+        messages=None,
+        user_id=user_id,
+        pool=pool,
+        bot=bot,
+        discord_channel_id=discord_channel_id,
+        thread_id=thread_id,
+        resume_command=resume_command,
+    )
+
+    if pool is not None and not response.startswith("Awaiting your confirmation"):
+        await db.insert_episodic_message(
+            pool,
+            user_id=user_id,
+            role="assistant",
+            content=response,
+        )
+        asyncio.create_task(extractor.maybe_extract(pool, user_id))
+
+    return response
+
