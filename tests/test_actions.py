@@ -26,6 +26,8 @@ class TestRiskTiers:
         assert is_medium_risk("delete_schedule")
         assert not is_medium_risk("list_schedules")
         assert not is_medium_risk("web_search")
+        assert not is_medium_risk("research")
+        assert not is_medium_risk("plan_schedule_change")
 
 
 class TestFormatActionSummary:
