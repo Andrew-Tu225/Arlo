@@ -225,7 +225,25 @@ async def run_react_graph(
     thread_id: str | None = None,
     resume_command: Any = None,
 ) -> str:
-    """Invoke a compiled ReAct graph and return the final response string."""
+    """Run the orchestrator ReAct graph and return the final response string.
+
+    This function is designed exclusively for the orchestrator (orchestrator.py),
+    which compiles its graph with a MemorySaver checkpointer. It relies on
+    aget_state to read persisted state after ainvoke — that call requires a
+    checkpointer and will crash with ValueError if the graph has none.
+
+    Two modes:
+    - Normal run: pass messages + thread_id. ainvoke runs the graph until the
+      model produces a plain-text reply or hits a ceiling. If the graph pauses
+      on a medium-risk tool (create/edit/delete schedule), aget_state detects
+      the interrupt and routes to Discord approval via actions.py.
+    - Resume: pass resume_command=Command(resume=True/False) + same thread_id.
+      ainvoke replays from the saved checkpoint with the user's approval decision.
+
+    Sub-agents (researcher, schedule planner) must NOT use this function.
+    They have no checkpointer, no interrupts, and no resume flow. Call
+    graph.ainvoke() directly and read the response from the returned state dict.
+    """
     config = {
         "configurable": {
             "thread_id": thread_id or user_id or "default",

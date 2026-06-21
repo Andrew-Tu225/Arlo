@@ -18,6 +18,7 @@ class TestToolMetadata:
     def test_orchestrator_tools(self):
         names = {s["function"]["name"] for s in get_orchestrator_schemas()}
         assert names == {
+            "research",
             "search_memory",
             "remember",
             "list_schedules",

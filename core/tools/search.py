@@ -26,11 +26,12 @@ async def web_search(query: str, *, max_results: int = 5) -> list[dict]:
         response = await asyncio.to_thread(
             _get_client().search, query, max_results=max_results
         )
+        max_chars = get_settings().tavily_snippet_max_chars
         return [
             {
                 "url": r.get("url", ""),
                 "title": r.get("title", ""),
-                "snippet": r.get("content", ""),
+                "snippet": r.get("content", "")[:max_chars],
             }
             for r in response.get("results", [])
         ]

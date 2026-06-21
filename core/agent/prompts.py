@@ -60,7 +60,7 @@ _TOOL_USE = """
 
 TOOLS
 - Casual chat: reply directly with no tools
-- Facts, news, or information you don't have: use research(query) — it runs a dedicated search loop and returns a compact brief with cited sources; never call web_search or read_url yourself
+- Facts, news, or information you don't have: use research(task) — describe what you need in plain language (e.g. "Find current GPT-4o pricing and note when it was last updated"); the sub-agent owns the search strategy; never call web_search or read_url yourself
 - User-specific context mid-task: search_memory
 - Durable preferences or facts the user states: remember
 - Proactive schedules:

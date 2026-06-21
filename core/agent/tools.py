@@ -96,7 +96,23 @@ def _make_list_schedules_tool(ctx: ToolContext) -> StructuredTool:
 # ── Public builders ────────────────────────────────────────────────────────
 
 def build_orchestrator_tools(ctx: ToolContext) -> list[StructuredTool]:
-    """Orchestrator tool surface: memory + schedule writes. No web_search/read_url."""
+    """Orchestrator tool surface: research + memory + schedule writes.
+
+    web_search and read_url are intentionally absent — the orchestrator never
+    calls them directly. All web research goes through research(), which runs
+    the research sub-agent in isolation and returns a compact brief.
+    """
+
+    async def research(task: str) -> str:
+        # Lazy import breaks the import cycle:
+        # researcher.py imports tools.py at module level (fine).
+        # tools.py importing researcher.py at module level would be circular.
+        from core.agent import researcher
+        try:
+            return await researcher.run_research(task, user_id=ctx.user_id)
+        except Exception:
+            logger.exception("research tool failed")
+            return RESEARCH_FALLBACK
 
     async def remember(fact: str, short_term: bool = False) -> str:
         text = fact.strip()
@@ -162,6 +178,17 @@ def build_orchestrator_tools(ctx: ToolContext) -> list[StructuredTool]:
         )
 
     return [
+        StructuredTool.from_function(
+            coroutine=research,
+            name="research",
+            description=(
+                "Run a dedicated web research loop and return a compact brief with cited sources. "
+                "Use for any facts, news, or current information you don't already know. "
+                "Pass a plain-language description of what you need — the sub-agent decides how to search. "
+                "Example: 'Find the current GPT-4o API pricing and note when it was last updated.' "
+                "Do not pass a raw search query string."
+            ),
+        ),
         _make_search_memory_tool(ctx),
         StructuredTool.from_function(
             coroutine=remember,
