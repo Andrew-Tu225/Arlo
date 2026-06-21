@@ -1,7 +1,15 @@
 """Agent tool definitions: LangChain tools, OpenAI schemas, and invocation.
 
-Schedule context (user_id, pool, bot) is injected via ToolContext when building tools.
-Medium-risk approval for schedule writes lands in actions.py (Phase 4.3).
+Three independent tool surfaces for the multi-agent design:
+  build_orchestrator_tools — memory + schedule writes (no web_search/read_url)
+  build_research_tools     — web_search + read_url (research sub-agent only)
+  build_planner_tools      — list_schedules + search_memory (schedule planner only)
+
+Each builder owns its tool implementations directly. Shared tools (search_memory,
+list_schedules) are extracted as private _make_* factories to avoid duplication.
+
+ToolContext injects request-scoped values (user_id, pool, bot).
+Medium-risk schedule writes (create/edit/delete) require Discord HITL — see actions.py.
 """
 
 from __future__ import annotations
@@ -24,8 +32,6 @@ RESEARCH_FALLBACK = (
     "I couldn't find a reliable source for that — want to narrow it down?"
 )
 
-_READONLY_TOOL_NAMES = frozenset({"web_search", "search_memory"})
-
 MEDIUM_RISK_TOOLS = frozenset({
     "create_schedule",
     "edit_schedule",
@@ -34,6 +40,7 @@ MEDIUM_RISK_TOOLS = frozenset({
 
 
 def is_medium_risk(tool_name: str) -> bool:
+    """Return True if tool_name requires Discord approval before execution."""
     return tool_name in MEDIUM_RISK_TOOLS
 
 
@@ -45,22 +52,10 @@ class ToolContext:
     discord_channel_id: str | None = None
 
 
-def build_tools(ctx: ToolContext) -> list[StructuredTool]:
-    """Build LangChain tools bound to the current request context."""
+# ── Shared tool factories (used by multiple builders) ──────────────────────
 
-    async def web_search(query: str) -> str:
-        text = query.strip()
-        if not text:
-            return "Error: query is empty"
-        results = await search.web_search(text)
-        return json.dumps(results)
-
-    async def read_url(url: str) -> str:
-        text = url.strip()
-        if not text:
-            return "Error: url is empty"
-        return await reader.read_url(text)
-
+def _make_search_memory_tool(ctx: ToolContext) -> StructuredTool:
+    """Build a search_memory StructuredTool bound to ctx; shared across sub-agent builders."""
     async def search_memory(query: str) -> str:
         text = query.strip()
         if not text:
@@ -74,6 +69,35 @@ def build_tools(ctx: ToolContext) -> list[StructuredTool]:
             return "Error: memory search failed"
         return json.dumps(facts)
 
+    return StructuredTool.from_function(
+        coroutine=search_memory,
+        name="search_memory",
+        description="Semantic search over stored facts about the user.",
+    )
+
+
+def _make_list_schedules_tool(ctx: ToolContext) -> StructuredTool:
+    """Build a list_schedules StructuredTool bound to ctx; shared across sub-agent builders."""
+    async def list_schedules() -> str:
+        if ctx.pool is None:
+            return "Error: schedule tools unavailable"
+        return await schedules.list_schedules(pool=ctx.pool, user_id=ctx.user_id)
+
+    return StructuredTool.from_function(
+        coroutine=list_schedules,
+        name="list_schedules",
+        description=(
+            "List the user's proactive schedules (name, task, cron). "
+            "Call before delete_schedule to get the exact name."
+        ),
+    )
+
+
+# ── Public builders ────────────────────────────────────────────────────────
+
+def build_orchestrator_tools(ctx: ToolContext) -> list[StructuredTool]:
+    """Orchestrator tool surface: memory + schedule writes. No web_search/read_url."""
+
     async def remember(fact: str, short_term: bool = False) -> str:
         text = fact.strip()
         if not text:
@@ -86,11 +110,6 @@ def build_tools(ctx: ToolContext) -> list[StructuredTool]:
             logger.exception("remember failed")
             return "Error: could not save memory"
         return "Saved."
-
-    async def list_schedules() -> str:
-        if ctx.pool is None:
-            return "Error: schedule tools unavailable"
-        return await schedules.list_schedules(pool=ctx.pool, user_id=ctx.user_id)
 
     async def create_schedule(
         name: str,
@@ -113,15 +132,6 @@ def build_tools(ctx: ToolContext) -> list[StructuredTool]:
             discord_channel_id=channel,
         )
 
-    async def delete_schedule(name: str) -> str:
-        if ctx.pool is None:
-            return "Error: schedule tools unavailable"
-        return await schedules.delete_schedule(
-            pool=ctx.pool,
-            user_id=ctx.user_id,
-            name=name,
-        )
-
     async def edit_schedule(
         name: str,
         task: str | None = None,
@@ -142,35 +152,23 @@ def build_tools(ctx: ToolContext) -> list[StructuredTool]:
             enabled=enabled,
         )
 
+    async def delete_schedule(name: str) -> str:
+        if ctx.pool is None:
+            return "Error: schedule tools unavailable"
+        return await schedules.delete_schedule(
+            pool=ctx.pool,
+            user_id=ctx.user_id,
+            name=name,
+        )
+
     return [
-        StructuredTool.from_function(
-            coroutine=web_search,
-            name="web_search",
-            description="Search the web for current information. Returns JSON list of url, title, snippet.",
-        ),
-        StructuredTool.from_function(
-            coroutine=read_url,
-            name="read_url",
-            description="Fetch and read plain text from a public HTTP(S) URL via Jina Reader.",
-        ),
-        StructuredTool.from_function(
-            coroutine=search_memory,
-            name="search_memory",
-            description="Semantic search over stored facts about the user.",
-        ),
+        _make_search_memory_tool(ctx),
         StructuredTool.from_function(
             coroutine=remember,
             name="remember",
             description="Save a durable fact about the user to long-term memory.",
         ),
-        StructuredTool.from_function(
-            coroutine=list_schedules,
-            name="list_schedules",
-            description=(
-                "List the user's proactive schedules (name, task, cron). "
-                "Call before delete_schedule to get the exact name."
-            ),
-        ),
+        _make_list_schedules_tool(ctx),
         StructuredTool.from_function(
             coroutine=create_schedule,
             name="create_schedule",
@@ -199,26 +197,78 @@ def build_tools(ctx: ToolContext) -> list[StructuredTool]:
     ]
 
 
-def _schema_ctx() -> ToolContext:
-    return ToolContext(user_id="")
+def build_research_tools(ctx: ToolContext) -> list[StructuredTool]:
+    """Research sub-agent tools: web_search + read_url."""
 
+    async def web_search(query: str) -> str:
+        text = query.strip()
+        if not text:
+            return "Error: query is empty"
+        results = await search.web_search(text)
+        return json.dumps(results)
 
-def get_openai_tool_schemas() -> list[dict[str, Any]]:
-    """OpenAI Chat Completions tool definitions for the reason node."""
-    return [convert_to_openai_tool(t) for t in build_tools(_schema_ctx())]
+    async def read_url(url: str) -> str:
+        text = url.strip()
+        if not text:
+            return "Error: url is empty"
+        return await reader.read_url(text)
 
-
-def get_readonly_openai_tool_schemas() -> list[dict[str, Any]]:
-    """Schemas for proactive run_schedule_agent (web_search + search_memory only)."""
     return [
-        s
-        for s in get_openai_tool_schemas()
-        if s["function"]["name"] in _READONLY_TOOL_NAMES
+        StructuredTool.from_function(
+            coroutine=web_search,
+            name="web_search",
+            description="Search the web for current information. Returns JSON list of url, title, snippet.",
+        ),
+        StructuredTool.from_function(
+            coroutine=read_url,
+            name="read_url",
+            description="Fetch and read plain text from a public HTTP(S) URL via Jina Reader.",
+        ),
     ]
 
 
-async def invoke_tool(name: str, args: dict[str, Any], ctx: ToolContext, tool_call_id: str = "") -> str:
-    """Execute a tool by name. Returns tool observation text."""
+def build_planner_tools(ctx: ToolContext) -> list[StructuredTool]:
+    """Schedule planner sub-agent tools: list_schedules + search_memory."""
+    return [_make_list_schedules_tool(ctx), _make_search_memory_tool(ctx)]
+
+
+# ── OpenAI schema getters ──────────────────────────────────────────────────
+
+def _schema_ctx() -> ToolContext:
+    """Return a minimal ToolContext for building schema-only tool instances."""
+    return ToolContext(user_id="")
+
+
+def get_orchestrator_schemas() -> list[dict[str, Any]]:
+    """OpenAI tool schemas for the orchestrator reason node."""
+    return [convert_to_openai_tool(t) for t in build_orchestrator_tools(_schema_ctx())]
+
+
+def get_research_schemas() -> list[dict[str, Any]]:
+    """OpenAI tool schemas for the research sub-agent (web_search + read_url)."""
+    return [convert_to_openai_tool(t) for t in build_research_tools(_schema_ctx())]
+
+
+def get_planner_schemas() -> list[dict[str, Any]]:
+    """OpenAI tool schemas for the schedule planner sub-agent (list_schedules + search_memory)."""
+    return [convert_to_openai_tool(t) for t in build_planner_tools(_schema_ctx())]
+
+
+# ── Dispatch ───────────────────────────────────────────────────────────────
+
+async def invoke_tool(
+    name: str,
+    args: dict[str, Any],
+    tool_map: dict[str, StructuredTool],
+    *,
+    tool_call_id: str = "",
+) -> str:
+    """Execute a tool by name from the caller-provided tool_map.
+
+    tool_map must be pre-built from the graph's own tool builder so that each
+    agent only dispatches within its own tool surface.
+    """
+    logger.info("Tool invocation: %s with args: %s", name, args)
     if is_medium_risk(name):
         try:
             approved = interrupt({
@@ -227,18 +277,20 @@ async def invoke_tool(name: str, args: dict[str, Any], ctx: ToolContext, tool_ca
                 "tool_call_id": tool_call_id,
             })
             if not approved:
+                logger.info("Tool execution rejected by user: %s", name)
                 return f"Error: User rejected the request to execute '{name}'. Do not perform the action."
         except RuntimeError:
-            # Standalone execution/tests outside of a runnable context
+            # Standalone execution / tests outside a runnable LangGraph context
             pass
 
-
-    tools = {tool.name: tool for tool in build_tools(ctx)}
-    tool = tools.get(name)
+    tool = tool_map.get(name)
     if tool is None:
+        logger.warning("Unknown tool invoked: %s", name)
         return f"Error: unknown tool '{name}'"
     if tool.coroutine is None:
+        logger.warning("Tool '%s' has no async implementation", name)
         return f"Error: tool '{name}' has no async implementation"
     result = await tool.coroutine(**args)
-    return result if isinstance(result, str) else str(result)
-
+    result_str = result if isinstance(result, str) else str(result)
+    logger.info("Tool result: %s -> %s", name, result_str[:1000] + ("..." if len(result_str) > 1000 else ""))
+    return result_str

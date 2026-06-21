@@ -1,6 +1,6 @@
-"""System prompt builder.
+"""System prompt builders and temporal context helpers.
 
-Produces the LLM system prompt by combining three layers:
+Produces LLM system prompts by combining three layers:
 
   1. Persona rules — anti-bot tone directives:
        - No filler phrases ("Sure!", "Happy to help!", "Certainly!")
@@ -8,7 +8,7 @@ Produces the LLM system prompt by combining three layers:
        - Has opinions; shares them without hedging
        - Matches user energy (tone, language, length, emotional register)
 
-  2. Content guardrails (always present from Week 1-2):
+  2. Content guardrails (always present):
        - Refuses harmful or dangerous requests
        - Will not impersonate real people
        - Stays honest about its own capabilities and limitations
@@ -16,10 +16,13 @@ Produces the LLM system prompt by combining three layers:
   3. Profile summary — lightweight injection of key facts (location,
      top interests) retrieved from mem0. Not the full memory store;
      detailed retrieval happens on-demand via the search_memory tool.
-
-No tone hint from a classifier — routing is implicit in how the model
-calls (or doesn't call) tools.
 """
+
+from datetime import datetime
+
+import pytz
+
+from core.settings import get_settings
 
 _PERSONA_RULES = """You are Arlo — a smart, opinionated friend, not a chatbot or assistant.
 
@@ -57,23 +60,53 @@ _TOOL_USE = """
 
 TOOLS
 - Casual chat: reply directly with no tools
-- Facts or news you do not know: web_search, then read_url if you need page detail
+- Facts, news, or information you don't have: use research(query) — it runs a dedicated search loop and returns a compact brief with cited sources; never call web_search or read_url yourself
 - User-specific context mid-task: search_memory
-- Durable preferences the user states: remember
-- Proactive schedules: list_schedules first; create_schedule, edit_schedule, or delete_schedule only when asked — schedule changes need the user to tap Confirm in Discord before anything runs"""
+- Durable preferences or facts the user states: remember
+- Proactive schedules:
+  - To see what's already scheduled: list_schedules (always check before editing or deleting)
+  - When the user describes a schedule change in natural language: plan_schedule_change(request) — interprets intent, returns structured plan (name, cron, task)
+  - To execute the plan: create_schedule, edit_schedule, or delete_schedule — these require the user to tap Confirm in Discord before anything is written"""
 
 
-def build_system_prompt(memories: list[str] | None = None) -> str:
-    """Build the LLM system prompt for the unified agent.
+def get_temporal_context() -> str:
+    """Return the current local time context formatted for the system prompt."""
+    settings = get_settings()
+    try:
+        tz = pytz.timezone(settings.digest_timezone)
+    except Exception:
+        tz = pytz.UTC
+
+    now = datetime.now(tz)
+    day_name = now.strftime("%A")
+    date_str = now.strftime("%B %d, %Y")
+    time_str = now.strftime("%I:%M %p")
+
+    return (
+        f"\n\nTEMPORAL CONTEXT\n"
+        f"- Current Date: {day_name}, {date_str}\n"
+        f"- Current Time: {time_str}\n"
+        f"- Timezone: {settings.digest_timezone}\n"
+        f"Use this current date and time as the reference anchor for all time-related tasks, "
+        f"date calculations, scheduling, and relative temporal queries. Use it to deduce the "
+        f"correct year/season for events (e.g. sporting playoffs or seasonal events) based on "
+        f"their typical time of year."
+    )
+
+
+def build_orchestrator_prompt(memories: list[str] | None = None) -> str:
+    """Build the LLM system prompt for the orchestrator agent.
 
     Args:
         memories: Optional list of user facts from mem0 to inject as a
-            profile summary. Unused in Phase 1; wired for Phase 2+.
+            profile summary. Detailed retrieval happens on-demand via
+            the search_memory tool.
 
     Returns:
         The complete system prompt string.
     """
     prompt = _PERSONA_RULES + _CONTENT_GUARDRAILS + _TOOL_USE
+    prompt += get_temporal_context()
 
     if memories:
         facts = "\n".join(f"- {m}" for m in memories)

@@ -17,18 +17,16 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from openai.types.chat import ChatCompletionMessageParam
 
-from core.agent.tools import RESEARCH_FALLBACK, ToolContext, invoke_tool
+from core.agent.tools import RESEARCH_FALLBACK, StructuredTool, ToolContext, invoke_tool
 from core.llm import get_client, get_default_model
+from core.settings import get_settings
 
 logger = logging.getLogger(__name__)
-
-checkpointer = MemorySaver()
 
 LLM_ERROR_FALLBACK = "Something went sideways on my end — can you try again?"
 
@@ -43,6 +41,7 @@ class ReActState(TypedDict, total=False):
 
 
 SystemPromptBuilder = Callable[[ReActState], str | Awaitable[str]]
+ToolBuilder = Callable[[ToolContext], list[StructuredTool]]
 
 
 @dataclass(frozen=True)
@@ -50,6 +49,7 @@ class ReactGraphConfig:
     """Configuration for a compiled ReAct graph."""
     build_system_prompt: SystemPromptBuilder
     tool_schemas: list[dict[str, Any]]
+    tool_builder: ToolBuilder
     max_react_iterations: int
     task_token_budget: int
     ceiling_fallback: str = RESEARCH_FALLBACK
@@ -65,8 +65,18 @@ def _last_assistant(
     return None
 
 
-def build_react_graph(graph_config: ReactGraphConfig) -> CompiledStateGraph:
-    """Compile a ReAct graph: reason ↔ tools until reply or ceiling."""
+def build_react_graph(
+    graph_config: ReactGraphConfig,
+    checkpointer: Any = None,
+) -> CompiledStateGraph:
+    """Compile a ReAct graph: reason ↔ tools until reply or ceiling.
+
+    Args:
+        graph_config: Prompt builder, tool schemas, and budget limits.
+        checkpointer: LangGraph checkpointer for state persistence. Pass a
+            ``MemorySaver`` for the orchestrator (enables interrupt/resume);
+            pass ``None`` for sub-agent graphs.
+    """
 
     async def reason(state: ReActState) -> dict[str, Any]:
         iterations = state.get("iteration_count", 0)
@@ -106,6 +116,7 @@ def build_react_graph(graph_config: ReactGraphConfig) -> CompiledStateGraph:
         new_messages = [*state.get("messages", []), assistant_message]
         new_token_usage = tokens + usage_delta
 
+        # check whether it goes over token limit
         if new_token_usage >= graph_config.task_token_budget:
             return {
                 "messages": new_messages,
@@ -145,6 +156,8 @@ def build_react_graph(graph_config: ReactGraphConfig) -> CompiledStateGraph:
             bot=bot,
             discord_channel_id=state.get("discord_channel_id"),
         )
+        tool_map = {t.name: t for t in graph_config.tool_builder(ctx)}
+        max_obs_chars = get_settings().tool_observation_max_chars
         tool_messages: list[ChatCompletionMessageParam] = []
 
         for call in assistant.get("tool_calls") or []:
@@ -158,7 +171,14 @@ def build_react_graph(graph_config: ReactGraphConfig) -> CompiledStateGraph:
             if not isinstance(args, dict):
                 args = {}
 
-            observation = await invoke_tool(name, args, ctx, tool_call_id=call.get("id", ""))
+            observation = await invoke_tool(name, args, tool_map, tool_call_id=call.get("id", ""))
+            if len(observation) > max_obs_chars:
+                logger.debug(
+                    "Tool observation truncated: tool=%s original=%d chars",
+                    name,
+                    len(observation),
+                )
+                observation = observation[:max_obs_chars] + " … [truncated]"
             tool_messages.append(
                 {
                     "role": "tool",

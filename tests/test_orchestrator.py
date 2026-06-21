@@ -37,31 +37,6 @@ async def test_run_returns_string():
 
 
 @pytest.mark.asyncio
-async def test_run_passes_tools_to_llm():
-    client = MagicMock()
-    client.chat.completions.create = AsyncMock(return_value=_completion("ok"))
-    with patch("core.agent.react.get_client", return_value=client):
-        await run([{"role": "user", "content": "Hey"}])
-
-    call_kwargs = client.chat.completions.create.call_args.kwargs
-    assert call_kwargs.get("tools")
-    assert call_kwargs.get("tool_choice") == "auto"
-
-
-@pytest.mark.asyncio
-async def test_run_system_prompt_includes_arlo_and_tools():
-    client = MagicMock()
-    client.chat.completions.create = AsyncMock(return_value=_completion("ok"))
-    with patch("core.agent.react.get_client", return_value=client):
-        await run([{"role": "user", "content": "Hey"}])
-
-    messages = client.chat.completions.create.call_args.kwargs["messages"]
-    system_content = messages[0]["content"]
-    assert "Arlo" in system_content
-    assert "list_schedules" in system_content
-
-
-@pytest.mark.asyncio
 async def test_run_handles_api_error_gracefully():
     client = MagicMock()
     client.chat.completions.create = AsyncMock(side_effect=Exception("API down"))

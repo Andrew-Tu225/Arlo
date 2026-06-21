@@ -27,10 +27,12 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from openai.types.chat import ChatCompletionMessageParam
 
+from langgraph.checkpoint.memory import MemorySaver
+
 from core import db
-from core.agent.persona import build_system_prompt
+from core.agent.prompts import build_orchestrator_prompt
 from core.agent.react import ReactGraphConfig, build_react_graph, run_react_graph
-from core.agent.tools import ToolContext, get_openai_tool_schemas
+from core.agent.tools import ToolContext, build_orchestrator_tools, get_orchestrator_schemas
 from core.memory import extractor
 from core.settings import get_settings
 
@@ -41,18 +43,19 @@ def _build_config() -> ReactGraphConfig:
     settings = get_settings()
 
     def build_system_prompt_for_state(_state: dict[str, Any]) -> str:
-        return build_system_prompt()
+        return build_orchestrator_prompt()
 
     return ReactGraphConfig(
         build_system_prompt=build_system_prompt_for_state,
-        tool_schemas=get_openai_tool_schemas(),
+        tool_schemas=get_orchestrator_schemas(),
+        tool_builder=build_orchestrator_tools,
         max_react_iterations=settings.max_react_iterations,
         task_token_budget=settings.task_token_budget,
         llm_error_fallback=FALLBACK_RESPONSE,
     )
 
 
-_compiled_graph: CompiledStateGraph = build_react_graph(_build_config())
+_compiled_graph: CompiledStateGraph = build_react_graph(_build_config(), checkpointer=MemorySaver())
 
 
 async def run(
