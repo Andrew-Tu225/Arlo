@@ -32,6 +32,10 @@ RESEARCH_FALLBACK = (
     "I couldn't find a reliable source for that — want to narrow it down?"
 )
 
+PLANNER_FALLBACK = (
+    "I need a bit more info to set that up — could you be more specific?"
+)
+
 MEDIUM_RISK_TOOLS = frozenset({
     "create_schedule",
     "edit_schedule",
@@ -113,6 +117,17 @@ def build_orchestrator_tools(ctx: ToolContext) -> list[StructuredTool]:
         except Exception:
             logger.exception("research tool failed")
             return RESEARCH_FALLBACK
+
+    async def plan_schedule_change(request: str) -> str:
+        # Lazy import — same circular-import reason as researcher above.
+        from core.agent import schedule_planner
+        try:
+            return await schedule_planner.run_schedule_planner(
+                request, user_id=ctx.user_id, pool=ctx.pool
+            )
+        except Exception:
+            logger.exception("plan_schedule_change tool failed")
+            return PLANNER_FALLBACK
 
     async def remember(fact: str, short_term: bool = False) -> str:
         text = fact.strip()
@@ -196,6 +211,17 @@ def build_orchestrator_tools(ctx: ToolContext) -> list[StructuredTool]:
             description="Save a durable fact about the user to long-term memory.",
         ),
         _make_list_schedules_tool(ctx),
+        StructuredTool.from_function(
+            coroutine=plan_schedule_change,
+            name="plan_schedule_change",
+            description=(
+                "Interpret a natural-language schedule request and return a structured plan "
+                "(action, name, cron, task). Call this before create_schedule, edit_schedule, or "
+                "delete_schedule whenever the user describes a schedule change in natural language. "
+                "Returns a SchedulePlan JSON string, or a clarifying question if the request is "
+                "ambiguous — relay that question to the user in your own voice."
+            ),
+        ),
         StructuredTool.from_function(
             coroutine=create_schedule,
             name="create_schedule",

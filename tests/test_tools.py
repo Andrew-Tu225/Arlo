@@ -22,6 +22,7 @@ class TestToolMetadata:
             "search_memory",
             "remember",
             "list_schedules",
+            "plan_schedule_change",
             "create_schedule",
             "edit_schedule",
             "delete_schedule",
