@@ -1,14 +1,15 @@
 """Agent tool definitions: LangChain tools, OpenAI schemas, and invocation.
 
-Three independent tool surfaces for the multi-agent design:
+Four independent tool surfaces for the multi-agent design:
   build_orchestrator_tools — memory + schedule writes (no web_search/read_url)
   build_research_tools     — web_search + read_url (research sub-agent only)
   build_planner_tools      — list_schedules + search_memory (schedule planner only)
+  build_proactive_tools    — search_memory + run_research + get_recent_sends
 
 Each builder owns its tool implementations directly. Shared tools (search_memory,
 list_schedules) are extracted as private _make_* factories to avoid duplication.
 
-ToolContext injects request-scoped values (user_id, pool, bot).
+ToolContext injects request-scoped values (user_id, pool, bot, schedule_id).
 Medium-risk schedule writes (create/edit/delete) require Discord HITL — see actions.py.
 """
 
@@ -23,6 +24,7 @@ from langchain_core.tools import StructuredTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.types import interrupt
 
+from core import db
 from core.memory import store
 from core.tools import reader, schedules, search
 
@@ -35,6 +37,8 @@ RESEARCH_FALLBACK = (
 PLANNER_FALLBACK = (
     "I need a bit more info to set that up — could you be more specific?"
 )
+
+PROACTIVE_FALLBACK = ""
 
 MEDIUM_RISK_TOOLS = frozenset({
     "create_schedule",
@@ -54,6 +58,7 @@ class ToolContext:
     pool: Any = None
     bot: Any = None
     discord_channel_id: str | None = None
+    schedule_id: int | None = None
 
 
 # ── Shared tool factories (used by multiple builders) ──────────────────────
@@ -285,6 +290,56 @@ def build_planner_tools(ctx: ToolContext) -> list[StructuredTool]:
     return [_make_list_schedules_tool(ctx), _make_search_memory_tool(ctx)]
 
 
+def build_proactive_tools(ctx: ToolContext) -> list[StructuredTool]:
+    """Proactive agent tools: search_memory + run_research + get_recent_sends.
+
+    Extensible by design — append new content sources (Twitter, Reddit) here.
+    The agent picks them up automatically via tool descriptions; nothing else changes.
+    """
+
+    async def run_research(task: str) -> str:
+        from core.agent import researcher
+        try:
+            return await researcher.run_research(task, user_id=ctx.user_id)
+        except Exception:
+            logger.exception("run_research tool failed in proactive agent")
+            return RESEARCH_FALLBACK
+
+    async def get_recent_sends(limit: int = 7) -> str:
+        if ctx.pool is None or ctx.schedule_id is None:
+            return "No previous sends."
+        try:
+            rows = await db.get_recent_runs(ctx.pool, schedule_id=ctx.schedule_id, limit=limit)
+        except Exception:
+            logger.exception("get_recent_sends failed")
+            return "Error: could not retrieve recent sends."
+        if not rows:
+            return "No previous sends."
+        return "\n---\n".join(r["message_preview"] for r in rows)
+
+    return [
+        _make_search_memory_tool(ctx),
+        StructuredTool.from_function(
+            coroutine=run_research,
+            name="run_research",
+            description=(
+                "Search the web for current news, events, scores, or info. "
+                "Pass a plain-language description of what you need. Only call when "
+                "you have something specific to look for."
+            ),
+        ),
+        StructuredTool.from_function(
+            coroutine=get_recent_sends,
+            name="get_recent_sends",
+            description=(
+                "Retrieve the last N messages you've already sent for this schedule. "
+                "Call before composing to avoid repeating topics you've recently covered. "
+                "Only call when topic variety matters for your task."
+            ),
+        ),
+    ]
+
+
 # ── OpenAI schema getters ──────────────────────────────────────────────────
 
 def _schema_ctx() -> ToolContext:
@@ -305,6 +360,11 @@ def get_research_schemas() -> list[dict[str, Any]]:
 def get_planner_schemas() -> list[dict[str, Any]]:
     """OpenAI tool schemas for the schedule planner sub-agent (list_schedules + search_memory)."""
     return [convert_to_openai_tool(t) for t in build_planner_tools(_schema_ctx())]
+
+
+def get_proactive_schemas() -> list[dict[str, Any]]:
+    """OpenAI tool schemas for the proactive agent (search_memory + run_research + get_recent_sends)."""
+    return [convert_to_openai_tool(t) for t in build_proactive_tools(_schema_ctx())]
 
 
 # ── Dispatch ───────────────────────────────────────────────────────────────
