@@ -4,129 +4,200 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Build](https://img.shields.io/badge/build-in_progress-yellow.svg)]()
 
 ---
 
 ## What is Arlo?
 
-Arlo is an AI companion that reaches out on its own.
+Arlo is an AI companion that lives in Discord and texts you like a smart friend — not a chatbot you have to prompt.
 
-Most AI tools wait to be spoken to. Arlo doesn't. Every morning it searches your interest space and sends you things it knows you'll care about — the way a friend texts you something they saw and thought of you. It also just chats. You can vent, catch up, ask it something random. It's a companion, not a query engine.
+Most AI tools wait to be asked. Arlo doesn't. It sends you things it knows you'll care about on its own schedule, remembers what matters to you across every conversation, and executes real tasks with web research when you need an answer, not a list of links.
 
-It remembers. Your interests, your opinions, your habits — picked up quietly across conversations and recalled naturally. Three months later, it still knows what you care about.
+**What it does:**
 
-When you need something done, describe it. Arlo searches, reads the sources, and comes back with a real answer — not links, synthesis.
-
-Currently runs on Discord. Telegram and other interfaces on the roadmap.
-
----
-
-## Features
-
-### 🧠 Persistent Memory
-
-Arlo learns from every conversation — your interests, opinions, preferences, and habits. Three months from now, it still knows what you care about. Memory is extracted passively — Arlo picks things up from what you say without you tagging or saving anything. Built on [mem0](https://mem0.ai/) and PostgreSQL with pgvector for semantic recall across sessions.
-
-### 📬 Proactive Outreach
-
-Arlo doesn't wait. Every morning it searches your interest space — news, releases, results you'd care about — and drops the best ones in your chat the way a friend would text you. It also just chats: you can vent, catch up, or ask it something random. You can pause the daily digest with `/digest off` and resume with `/digest on`.
-
-### 🛠️ Task Execution
-
-Describe a goal in plain language. Arlo breaks it down, searches the web, reads the relevant pages, and returns a synthesized answer with citations — not a list of links, a real answer. Powered by a [LangGraph](https://github.com/langchain-ai/langgraph) ReAct loop with a hard ceiling of 8 tool-use iterations.
+- **Reaches out proactively.** Scheduled jobs fire throughout the day — morning digest, evening wrap-up, reminders you set — composed fresh each time using your memory and live web search.
+- **Remembers you.** Interests, opinions, habits, life context — extracted passively from what you say and recalled naturally, even months later.
+- **Researches and synthesizes.** Describe what you need. Arlo searches, reads the relevant pages, and sends back a real answer with sources — not links.
+- **Manages your schedules conversationally.** Create, edit, or delete proactive reminders in plain language. Changes require your Discord approval before they go through.
 
 ---
 
-## How It Works
+## Architecture
 
 Arlo runs two subsystems in parallel inside a single process:
 
-- **Reactive** — responds to your Discord messages: classifies tone and intent, retrieves relevant memories, and routes to chat, task, or memory-update handling.
-- **Proactive** — an APScheduler job that wakes up daily, reads your interest profile, fetches fresh content, and sends a personalized digest to your Discord channel.
+### Reactive path — user-triggered
 
----
+```
+Discord message
+  └─ handlers.py: filter gate (guild/user ID check) → INSERT episodic_messages
+       └─ orchestrator.py: LangGraph ReAct + MemorySaver
+            ├─ search_memory / remember          (inline — mem0)
+            ├─ list_schedules                    (inline — DB read)
+            ├─ research(task)          ──────►  researcher.py  (ephemeral ReAct)
+            │                                       tools: web_search, read_url
+            │                                       returns: ResearchBrief JSON
+            ├─ plan_schedule_change(request) ──► schedule_planner.py  (ephemeral ReAct)
+            │                                       tools: list_schedules, search_memory
+            │                                       returns: SchedulePlan JSON
+            └─ create/edit/delete_schedule      (HITL — Discord approval required)
+                 └─ actions.py: interrupt() → Discord View buttons → resume()
+  └─ Discord reply
+       └─ background: extractor.maybe_extract() every N messages
+```
 
-## Build on Arlo
+### Proactive path — scheduler-triggered
 
-Arlo is an open source backend for AI companion products. The core is a reusable, opinionated agent stack:
+```
+APScheduler cron fires
+  └─ digest.py: run_schedule_job(schedule_row)
+       └─ proactive.py: ephemeral ReAct agent
+            ├─ search_memory      → user context for personalization
+            ├─ run_research        → fresh content via researcher sub-agent
+            └─ get_recent_sends   → last 7 messages for anti-repetition
+  └─ discord.send(composed message)
+       └─ INSERT schedule_run_log
+```
 
-- **Memory layer** — mem0 + pgvector for persistent, semantic user profiles; passive extraction from conversation history
-- **Proactive scheduler** — APScheduler-powered daily outreach that runs inside the bot process; no external queue or cron required
-- **ReAct agent** — LangGraph loop with Tavily search and Jina Reader; hard ceiling of 8 iterations
+### Multi-agent design
 
-Fork it, build the wrapper your users need, and deploy via Docker Compose on any VPS.
+The orchestrator never runs web searches directly. It delegates to isolated sub-agents that run their own ReAct loop and return a single compressed result — raw Tavily payloads and intermediate reasoning stay out of the orchestrator's context window.
+
+| Component | Checkpointer | Role |
+|-----------|-------------|------|
+| Orchestrator | MemorySaver (persistent per user) | Routes messages; manages memory and schedules |
+| Research sub-agent | None (ephemeral) | Web search + URL reading; returns `ResearchBrief` JSON |
+| Schedule planner sub-agent | None (ephemeral) | NL → `SchedulePlan` JSON or clarifying question |
+| Proactive agent | None (ephemeral) | Composes scheduled Discord messages |
+
+### Memory layers
+
+| Layer | What's stored | Backend | How retrieved |
+|-------|--------------|---------|---------------|
+| Short-term context | Last `CONTEXT_WINDOW_SIZE` messages | PostgreSQL `episodic_messages` | SELECT last N rows, injected into prompt |
+| Long-term semantic | Facts, preferences, traits | PostgreSQL + pgvector (via mem0) | `search_memory` tool — semantic similarity |
+| Schedule history | Recent sends per schedule | PostgreSQL `schedule_run_log` | `get_recent_sends` tool — anti-repetition |
 
 ---
 
 ## Tech Stack
 
 | Layer | Technology |
-|---|---|
-| LLM | OpenAI (GPT-4o) or OpenRouter (configurable) |
-| Agent orchestration | LangGraph — ReAct loop, max 8 iterations |
+|-------|-----------|
+| LLM | OpenAI (GPT-4o) or OpenRouter — swap via `LLM_PROVIDER` |
+| Agent orchestration | LangGraph — shared `build_react_graph` factory; MemorySaver for orchestrator |
 | Memory | mem0 (self-hosted) + PostgreSQL + pgvector |
 | Web search | Tavily API |
-| URL reading | Jina Reader |
-| Discord | discord.py |
-| Scheduler | APScheduler (in-process) |
-| Backend | FastAPI (health check) |
+| URL reading | Jina Reader (`r.jina.ai/{url}`) with SSRF validation |
+| Discord | discord.py — single-server, single-user |
+| Scheduler | APScheduler (in-process, cron rows from DB) |
+| Backend | FastAPI (health check + future hooks) |
 | Deployment | Docker Compose |
 
 ---
 
-## Getting Started
+## Local Setup
 
 ### Prerequisites
 
 - Python 3.11+
-- Docker (for PostgreSQL + pgvector)
+- Docker (for PostgreSQL)
 - API keys: an LLM provider (OpenAI or OpenRouter), Tavily, and a Discord bot token
 
-### Setup
+### 1. Clone and install
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/yourname/arlo.git
-cd arlo
+git clone https://github.com/Andrew-Tu225/Arlo.git
+cd Arlo
 
-# 2. Create and activate a virtual environment
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-# 3. Install dependencies
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
+```
 
-# 4. Configure environment variables
+### 2. Configure environment variables
+
+```bash
 cp .env.example .env
-# Open .env and fill in your API keys
+```
 
-# 5. Start the database
+Open `.env` and fill in at minimum:
+
+```bash
+OPENAI_API_KEY=sk-...            # or OPENROUTER_API_KEY + LLM_PROVIDER=openrouter
+TAVILY_API_KEY=tvly-...
+DISCORD_BOT_TOKEN=...
+DISCORD_GUILD_ID=...             # right-click your server → Copy Server ID
+DISCORD_USER_ID=...              # right-click your profile → Copy User ID
+```
+
+### 3. Start the database
+
+```bash
 docker compose up -d
+```
 
-# 6. Run the bot
+This starts a PostgreSQL 16 container on port 5432. The bot creates all tables on first startup.
+
+### 4. Run the bot
+
+```bash
 python -m core.interfaces.discord.bot
 ```
 
-> **Note:** The bot is currently in active development. The command above will confirm the process starts; full functionality arrives incrementally as each subsystem is implemented.
+For the optional FastAPI health server alongside:
+
+```bash
+uvicorn core.api:app --reload
+```
 
 ---
 
 ## Environment Variables
 
-| Variable | Description | Default |
-|---|---|---|
-| `OPENAI_API_KEY` | OpenAI API key | — |
-| `OPENROUTER_API_KEY` | OpenRouter API key (alternative to OpenAI) | — |
-| `LLM_PROVIDER` | Which LLM provider to use | `openai` |
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://postgres:yourpassword@localhost:5432/arlo` |
-| `TAVILY_API_KEY` | Tavily web search API key | — |
-| `DISCORD_BOT_TOKEN` | Discord bot token | — |
-| `DISCORD_GUILD_ID` | ID of the Discord server Arlo runs in | — |
-| `ENVIRONMENT` | Runtime environment | `development` |
-| `LOG_LEVEL` | Logging verbosity | `info` |
-| `PROFILE_EXTRACTION_INTERVAL` | Extract profile facts every N messages | `10` |
-| `MAX_REACT_ITERATIONS` | Hard ceiling on the ReAct tool-use loop | `8` |
+### Required at startup (missing = hard stop)
+
+| Variable | Description |
+|----------|-------------|
+| `DISCORD_BOT_TOKEN` | Discord bot token |
+| `DISCORD_GUILD_ID` | Server ID — messages from other servers are dropped |
+| `DISCORD_USER_ID` | Your Discord user ID — only this user's messages are processed |
+| `DATABASE_URL` | PostgreSQL connection string |
+| `TAVILY_API_KEY` | Tavily web search key |
+| `OPENAI_API_KEY` or `OPENROUTER_API_KEY` | At least one LLM key required |
+
+### Optional (defaults shown)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_PROVIDER` | `openai` | `openai` or `openrouter` |
+| `DIGEST_TIME` | `09:00` | Morning digest time (HH:MM) |
+| `EVENING_DIGEST_TIME` | `20:00` | Evening digest time (HH:MM) |
+| `DIGEST_TIMEZONE` | `America/Toronto` | IANA timezone string |
+| `CONTEXT_WINDOW_SIZE` | `12` | Recent messages passed to the orchestrator |
+| `PROFILE_EXTRACTION_INTERVAL` | `10` | Extract memory facts every N messages |
+| `MAX_REACT_ITERATIONS` | `8` | Orchestrator ReAct loop ceiling |
+| `TASK_TOKEN_BUDGET` | `8000` | Orchestrator token ceiling; honest fallback on exceed |
+| `RESEARCH_MAX_REACT_ITERATIONS` | `12` | Research sub-agent loop ceiling |
+| `RESEARCH_TASK_TOKEN_BUDGET` | `12000` | Research sub-agent token ceiling |
+| `PLANNER_MAX_REACT_ITERATIONS` | `6` | Schedule planner loop ceiling |
+| `PLANNER_TASK_TOKEN_BUDGET` | `6000` | Schedule planner token ceiling |
+| `PROACTIVE_MAX_REACT_ITERATIONS` | `5` | Proactive agent loop ceiling |
+| `PROACTIVE_TASK_TOKEN_BUDGET` | `8000` | Proactive agent token ceiling |
+| `TOOL_OBSERVATION_MAX_CHARS` | `2000` | Truncate tool responses to this length |
+| `TAVILY_SNIPPET_MAX_CHARS` | `280` | Per-result snippet length in web search |
+
+---
+
+## Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/profile` | Show everything Arlo knows about you (ephemeral) |
+| `/forget <topic>` | Remove memory facts matching a topic (ephemeral) |
+
+Schedule management is conversational — just tell Arlo what you want ("set a gym reminder at 7am", "move my standup to 9:30"). Schedule writes require Discord button approval before they execute.
 
 ---
 
@@ -135,15 +206,41 @@ python -m core.interfaces.discord.bot
 ```
 arlo/
 ├── core/
-│   ├── llm.py                        # LLM client abstraction
-│   ├── memory/                       # User profile storage (mem0 + pgvector)
-│   ├── agent/                        # ReAct loop, classifier, persona builder
-│   ├── tools/                        # Tavily search + Jina Reader
-│   ├── scheduler/                    # Daily proactive digest (APScheduler)
-│   ├── interfaces/discord/           # Bot, event handlers, slash commands
+│   ├── llm.py                        # LLM client abstraction (OpenAI / OpenRouter)
+│   ├── settings.py                   # pydantic-settings; fail-fast at startup
+│   ├── db.py                         # asyncpg; all table DDL and queries
+│   ├── memory/
+│   │   ├── store.py                  # mem0 read/write/delete
+│   │   ├── extractor.py              # background profile extraction
+│   │   └── models.py                 # UserProfile, MemoryEntry
+│   ├── agent/
+│   │   ├── react.py                  # shared build_react_graph factory
+│   │   ├── orchestrator.py           # user-facing agent; MemorySaver + HITL
+│   │   ├── researcher.py             # research sub-agent; returns ResearchBrief JSON
+│   │   ├── schedule_planner.py       # planner sub-agent; returns SchedulePlan JSON
+│   │   ├── proactive.py              # scheduled message composer
+│   │   ├── prompts.py                # system prompt builders
+│   │   ├── tools.py                  # tool builders + OpenAI schemas per surface
+│   │   └── actions.py                # HITL: pending_actions table + Discord View
+│   ├── tools/
+│   │   ├── search.py                 # Tavily wrapper
+│   │   ├── reader.py                 # SSRF validation + Jina Reader
+│   │   └── schedules.py              # schedule DB read/write tools
+│   ├── scheduler/
+│   │   └── digest.py                 # APScheduler setup + job runner
+│   ├── interfaces/discord/
+│   │   ├── bot.py                    # discord.py setup + startup validation
+│   │   ├── handlers.py               # on_message filter gate + agent dispatch
+│   │   └── commands.py               # /profile, /forget slash commands
 │   └── api.py                        # FastAPI health check
-├── tests/
-├── docs/
+├── evals/                            # LLM-judged eval suite (no Discord/DB required)
+│   ├── eval_researcher.py            # 10 scenarios — 88.6% pass
+│   ├── eval_schedule_planner.py      # 12 scenarios — 92.9% pass
+│   ├── eval_proactive.py             # 10 scenarios — 90.0% pass
+│   ├── eval_orchestrator_routing.py  # 12 scenarios — 95.8% pass
+│   ├── eval_persona.py               # persona + guardrail eval
+│   └── eval_extractor.py             # memory extraction eval
+├── tests/                            # pytest unit + integration suite
 ├── docker-compose.yml
 ├── requirements.txt
 └── .env.example
@@ -151,21 +248,41 @@ arlo/
 
 ---
 
-## Roadmap
+## Testing
 
-- [x] Project scaffolding & architecture
-- [ ] Discord bot + basic LLM conversation
-- [ ] Memory: passive extraction + PostgreSQL + pgvector storage
-- [ ] Daily proactive digest via APScheduler
-- [ ] ReAct task loop (Tavily + Jina + LangGraph)
-- [ ] Persona tuning, onboarding `/start`, profile commands, guardrails
-- [ ] Polish, testing, and public launch
+```bash
+# Unit + integration tests
+pytest
+
+# With coverage
+pytest --cov=core --cov-report=term-missing
+
+# LLM-judged evals (requires OPENAI_API_KEY or OPENROUTER_API_KEY)
+python -m evals.eval_researcher
+python -m evals.eval_schedule_planner
+python -m evals.eval_orchestrator_routing
+PYTHONIOENCODING=utf-8 python -m evals.eval_proactive
+```
 
 ---
 
-## Contributing
+## Roadmap
 
-Contributions are welcome. Please open an issue to discuss significant changes before submitting a pull request.
+- [x] Discord bot + LLM conversation
+- [x] Persistent memory — passive extraction + PostgreSQL + pgvector
+- [x] Multi-agent orchestrator — research, schedule planner, HITL approval
+- [x] Proactive scheduled messages with anti-repetition
+- [x] LLM-judged eval suite
+- [ ] `/start` onboarding flow
+- [ ] `edit_schedule` tool implementation
+- [ ] Poll-based schedule runner
+- [ ] Telegram interface
+
+### Future goals
+
+- **Productive agent** — task management, goal tracking, and accountability check-ins built on top of the proactive scheduler
+- **Richer content sources** — X/Twitter, Reddit, YouTube, Spotify, and other feeds as first-class tools the proactive agent can pull from, so Arlo surfaces content wherever you actually spend time
+- **More platform interfaces** — Telegram, iMessage, WhatsApp; the core agent is interface-agnostic
 
 ---
 
