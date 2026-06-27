@@ -3,10 +3,8 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from core.scheduler.digest import (
-    _build_prompt,
     _hhmm_to_cron,
     register_digest_jobs,
-    run_schedule_agent,
     run_schedule_job,
     seed_default_schedules,
 )
@@ -25,22 +23,6 @@ class TestHhmmToCron:
 
     def test_strips_leading_zeros(self):
         assert _hhmm_to_cron("08:05") == "5 8 * * *"
-
-
-class TestBuildPrompt:
-    def test_includes_task(self):
-        assert "Start a morning conversation" in _build_prompt(
-            task="Start a morning conversation", profile_facts=[]
-        )
-
-    def test_includes_profile_facts(self):
-        assert "user likes Python" in _build_prompt(task="task", profile_facts=["user likes Python"])
-
-    def test_empty_sentinel_instruction_present(self):
-        assert "empty" in _build_prompt(task="task", profile_facts=[]).lower()
-
-    def test_no_facts_section_when_empty(self):
-        assert "profile facts" not in _build_prompt(task="task", profile_facts=[]).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -88,104 +70,6 @@ class TestSeedDefaultSchedules:
 
 
 # ---------------------------------------------------------------------------
-# run_schedule_agent
-# ---------------------------------------------------------------------------
-
-class TestRunScheduleAgent:
-    async def test_returns_composed_message(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "Good morning!"
-
-        with (
-            patch("core.scheduler.digest.store.search", new=AsyncMock(return_value=[])),
-            patch("core.scheduler.digest.get_client") as mock_client,
-        ):
-            mock_client.return_value.chat.completions.create = AsyncMock(return_value=mock_response)
-            result = await run_schedule_agent(task="Say good morning", user_id="u1")
-
-        assert result == "Good morning!"
-
-    async def test_returns_empty_on_empty_sentinel(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "empty"
-
-        with (
-            patch("core.scheduler.digest.store.search", new=AsyncMock(return_value=[])),
-            patch("core.scheduler.digest.get_client") as mock_client,
-        ):
-            mock_client.return_value.chat.completions.create = AsyncMock(return_value=mock_response)
-            result = await run_schedule_agent(task="task", user_id="u1")
-
-        assert result == ""
-
-    async def test_returns_empty_on_llm_error(self):
-        with (
-            patch("core.scheduler.digest.store.search", new=AsyncMock(return_value=[])),
-            patch("core.scheduler.digest.get_client") as mock_client,
-        ):
-            mock_client.return_value.chat.completions.create = AsyncMock(
-                side_effect=RuntimeError("LLM down")
-            )
-            result = await run_schedule_agent(task="task", user_id="u1")
-
-        assert result == ""
-
-    async def test_continues_when_store_search_fails(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "Brief"
-
-        with (
-            patch("core.scheduler.digest.store.search", new=AsyncMock(side_effect=RuntimeError("mem0 down"))),
-            patch("core.scheduler.digest.get_client") as mock_client,
-        ):
-            mock_client.return_value.chat.completions.create = AsyncMock(return_value=mock_response)
-            result = await run_schedule_agent(task="task", user_id="u1")
-
-        assert result == "Brief"
-
-    async def test_injects_channel_topic_when_provided(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "Sports update"
-        captured = {}
-
-        async def fake_create(**kwargs):
-            captured["content"] = kwargs["messages"][0]["content"]
-            return mock_response
-
-        with (
-            patch("core.scheduler.digest.store.search", new=AsyncMock(return_value=[])),
-            patch("core.scheduler.digest.get_client") as mock_client,
-        ):
-            mock_client.return_value.chat.completions.create = fake_create
-            await run_schedule_agent(task="Find scores", user_id="u1", channel_topic="NBA sports")
-
-        assert "NBA sports" in captured["content"]
-
-    async def test_no_channel_topic_for_dm(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "Hey!"
-        captured = {}
-
-        async def fake_create(**kwargs):
-            captured["content"] = kwargs["messages"][0]["content"]
-            return mock_response
-
-        with (
-            patch("core.scheduler.digest.store.search", new=AsyncMock(return_value=[])),
-            patch("core.scheduler.digest.get_client") as mock_client,
-        ):
-            mock_client.return_value.chat.completions.create = fake_create
-            await run_schedule_agent(task="Morning message", user_id="u1", channel_topic=None)
-
-        assert "Channel context" not in captured["content"]
-
-
-# ---------------------------------------------------------------------------
 # run_schedule_job
 # ---------------------------------------------------------------------------
 
@@ -211,8 +95,9 @@ class TestRunScheduleJob:
 
         with (
             patch("core.scheduler.digest.db.get_schedule", new=AsyncMock(return_value=sched)),
+            patch("core.scheduler.digest.db.insert_schedule_run", new=AsyncMock()),
             patch("core.scheduler.digest.db.update_schedule_last_sent", new=AsyncMock()),
-            patch("core.scheduler.digest.run_schedule_agent", new=AsyncMock(return_value="Hey!")),
+            patch("core.agent.proactive.run_proactive_agent", new=AsyncMock(return_value="Hey!")),
         ):
             await run_schedule_job(bot, pool, schedule_id=1)
 
@@ -227,8 +112,9 @@ class TestRunScheduleJob:
 
         with (
             patch("core.scheduler.digest.db.get_schedule", new=AsyncMock(return_value=sched)),
+            patch("core.scheduler.digest.db.insert_schedule_run", new=AsyncMock()),
             patch("core.scheduler.digest.db.update_schedule_last_sent", new=AsyncMock()),
-            patch("core.scheduler.digest.run_schedule_agent", new=AsyncMock(return_value="Update!")),
+            patch("core.agent.proactive.run_proactive_agent", new=AsyncMock(return_value="Update!")),
         ):
             await run_schedule_job(bot, pool, schedule_id=1)
 
@@ -245,11 +131,72 @@ class TestRunScheduleJob:
 
         with (
             patch("core.scheduler.digest.db.get_schedule", new=AsyncMock(return_value=sched)),
-            patch("core.scheduler.digest.run_schedule_agent", new=AsyncMock(return_value="")),
+            patch("core.agent.proactive.run_proactive_agent", new=AsyncMock(return_value="")),
         ):
             await run_schedule_job(bot, pool, schedule_id=1)
 
         dm.send.assert_not_called()
+
+    async def test_inserts_run_log_after_successful_send(self):
+        sched = _make_schedule(discord_channel_id=None, user_id="123")
+        dm = AsyncMock()
+        user = AsyncMock()
+        user.create_dm = AsyncMock(return_value=dm)
+        bot = AsyncMock()
+        bot.fetch_user = AsyncMock(return_value=user)
+        pool = MagicMock()
+
+        mock_insert_run = AsyncMock()
+        with (
+            patch("core.scheduler.digest.db.get_schedule", new=AsyncMock(return_value=sched)),
+            patch("core.scheduler.digest.db.insert_schedule_run", new=mock_insert_run),
+            patch("core.scheduler.digest.db.update_schedule_last_sent", new=AsyncMock()),
+            patch("core.agent.proactive.run_proactive_agent", new=AsyncMock(return_value="Hey!")),
+        ):
+            await run_schedule_job(bot, pool, schedule_id=1)
+
+        mock_insert_run.assert_called_once()
+        kwargs = mock_insert_run.call_args.kwargs
+        assert kwargs["schedule_id"] == 1
+        assert kwargs["user_id"] == "123"
+        assert kwargs["message_preview"] == "Hey!"
+
+    async def test_does_not_insert_run_log_when_agent_returns_empty(self):
+        sched = _make_schedule(discord_channel_id=None, user_id="123")
+        bot = AsyncMock()
+        pool = MagicMock()
+        mock_insert_run = AsyncMock()
+
+        with (
+            patch("core.scheduler.digest.db.get_schedule", new=AsyncMock(return_value=sched)),
+            patch("core.scheduler.digest.db.insert_schedule_run", new=mock_insert_run),
+            patch("core.agent.proactive.run_proactive_agent", new=AsyncMock(return_value="")),
+        ):
+            await run_schedule_job(bot, pool, schedule_id=1)
+
+        mock_insert_run.assert_not_called()
+
+    async def test_passes_schedule_id_and_pool_to_agent(self):
+        sched = _make_schedule(discord_channel_id=None, user_id="123")
+        dm = AsyncMock()
+        user = AsyncMock()
+        user.create_dm = AsyncMock(return_value=dm)
+        bot = AsyncMock()
+        bot.fetch_user = AsyncMock(return_value=user)
+        pool = MagicMock()
+        mock_agent = AsyncMock(return_value="Hello!")
+
+        with (
+            patch("core.scheduler.digest.db.get_schedule", new=AsyncMock(return_value=sched)),
+            patch("core.scheduler.digest.db.insert_schedule_run", new=AsyncMock()),
+            patch("core.scheduler.digest.db.update_schedule_last_sent", new=AsyncMock()),
+            patch("core.agent.proactive.run_proactive_agent", new=mock_agent),
+        ):
+            await run_schedule_job(bot, pool, schedule_id=1)
+
+        kwargs = mock_agent.call_args.kwargs
+        assert kwargs["schedule_id"] == 1
+        assert kwargs["pool"] is pool
 
     async def test_skips_when_schedule_not_found(self):
         bot = MagicMock()
@@ -266,7 +213,10 @@ class TestRunScheduleJob:
         bot.get_channel = MagicMock(return_value=None)
         pool = MagicMock()
 
-        with patch("core.scheduler.digest.db.get_schedule", new=AsyncMock(return_value=sched)):
+        with (
+            patch("core.scheduler.digest.db.get_schedule", new=AsyncMock(return_value=sched)),
+            patch("core.agent.proactive.run_proactive_agent", new=AsyncMock(return_value="Hi")),
+        ):
             await run_schedule_job(bot, pool, schedule_id=1)  # should not raise
 
     async def test_truncates_long_messages(self):
@@ -280,8 +230,9 @@ class TestRunScheduleJob:
 
         with (
             patch("core.scheduler.digest.db.get_schedule", new=AsyncMock(return_value=sched)),
+            patch("core.scheduler.digest.db.insert_schedule_run", new=AsyncMock()),
             patch("core.scheduler.digest.db.update_schedule_last_sent", new=AsyncMock()),
-            patch("core.scheduler.digest.run_schedule_agent", new=AsyncMock(return_value="x" * 2000)),
+            patch("core.agent.proactive.run_proactive_agent", new=AsyncMock(return_value="x" * 2000)),
         ):
             await run_schedule_job(bot, pool, schedule_id=1)
 

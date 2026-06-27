@@ -12,12 +12,17 @@ from core.db import (
     get_enabled_channels,
     get_enabled_schedules,
     get_recent_messages,
+    get_recent_runs,
     get_schedule,
+    get_schedule_by_name,
+    list_schedules_for_user,
     init_tables,
     insert_channel,
     insert_episodic_message,
     insert_schedule,
+    insert_schedule_run,
     prune_old_messages,
+    prune_schedule_run_log,
     set_channels_enabled,
     set_schedules_enabled,
     update_schedule,
@@ -79,6 +84,13 @@ class TestInitTables:
         await init_tables(pool)
         combined = " ".join(str(c) for c in conn.execute.call_args_list)
         assert "arlo_channels" in combined
+
+    @pytest.mark.asyncio
+    async def test_creates_pending_actions_table(self):
+        pool, conn = _make_pool()
+        await init_tables(pool)
+        combined = " ".join(str(c) for c in conn.execute.call_args_list)
+        assert "pending_actions" in combined
 
 
 class TestInsertEpisodicMessage:
@@ -181,13 +193,14 @@ def _make_schedule_record(
     id_=1, user_id="u1", name="morning-proactive",
     task="Morning task", discord_channel_id=None,
     channel_topic=None, cron_schedule="0 9 * * *",
+    enabled=True,
 ):
     rec = MagicMock()
     rec.__getitem__ = lambda self, k: {
         "id": id_, "user_id": user_id, "name": name, "task": task,
         "discord_channel_id": discord_channel_id, "channel_topic": channel_topic,
         "cron_schedule": cron_schedule, "poll_interval_secs": None,
-        "last_sent_at": None, "enabled": True, "created_at": _NOW,
+        "last_sent_at": None, "enabled": enabled, "created_at": _NOW,
     }[k]
     return rec
 
@@ -265,6 +278,38 @@ class TestGetSchedule:
         pool, conn = _make_pool(fetch=[rec])
         result = await get_schedule(pool, schedule_id=1)
         assert result["discord_channel_id"] == "111"
+
+
+class TestGetScheduleByName:
+    @pytest.mark.asyncio
+    async def test_returns_none_when_not_found(self):
+        pool, conn = _make_pool(fetch=[])
+        result = await get_schedule_by_name(pool, user_id="u1", name="missing")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_row_when_found(self):
+        rec = _make_schedule_record()
+        pool, conn = _make_pool(fetch=[rec])
+        result = await get_schedule_by_name(pool, user_id="u1", name="morning-proactive")
+        assert result is not None
+        assert result["name"] == "morning-proactive"
+
+
+class TestListSchedulesForUser:
+    @pytest.mark.asyncio
+    async def test_returns_all_schedules_including_disabled(self):
+        rec = _make_schedule_record(enabled=False)
+        pool, conn = _make_pool(fetch=[rec])
+        result = await list_schedules_for_user(pool, user_id="u1")
+        assert len(result) == 1
+        assert result[0]["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_passes_user_id(self):
+        pool, conn = _make_pool(fetch=[])
+        await list_schedules_for_user(pool, user_id="u42")
+        assert "u42" in conn.fetch.call_args.args
 
 
 class TestGetEnabledSchedules:
@@ -447,3 +492,88 @@ class TestSetChannelsEnabled:
         args = conn.execute.call_args.args
         assert "u1" in args
         assert True in args
+
+
+# ---------------------------------------------------------------------------
+# Schedule run log
+# ---------------------------------------------------------------------------
+
+class TestInsertScheduleRun:
+    @pytest.mark.asyncio
+    async def test_executes_insert(self):
+        pool, conn = _make_pool()
+        await insert_schedule_run(pool, schedule_id=1, user_id="u1", message_preview="Hey!")
+        assert conn.execute.called
+
+    @pytest.mark.asyncio
+    async def test_passes_schedule_id_user_id_preview(self):
+        pool, conn = _make_pool()
+        await insert_schedule_run(pool, schedule_id=5, user_id="u1", message_preview="Morning!")
+        args = conn.execute.call_args.args
+        assert 5 in args
+        assert "u1" in args
+        assert "Morning!" in args
+
+
+class TestGetRecentRuns:
+    def _make_run_record(self, id_=1, schedule_id=1, preview="Hello"):
+        rec = MagicMock()
+        rec.__getitem__ = lambda self, k: {
+            "id": id_, "schedule_id": schedule_id, "user_id": "u1",
+            "sent_at": _NOW, "message_preview": preview,
+        }[k]
+        rec.keys = lambda self=rec: ["id", "schedule_id", "user_id", "sent_at", "message_preview"]
+        # Support dict(row) via items()
+        rec.items = lambda self=rec: {
+            "id": id_, "schedule_id": schedule_id, "user_id": "u1",
+            "sent_at": _NOW, "message_preview": preview,
+        }.items()
+        return rec
+
+    @pytest.mark.asyncio
+    async def test_returns_list_of_dicts(self):
+        rec = self._make_run_record()
+        pool, conn = _make_pool(fetch=[rec])
+        # dict(asyncpg.Record) needs __iter__ — use MagicMock with mapping protocol
+        conn.fetch = AsyncMock(return_value=[{"id": 1, "schedule_id": 1, "user_id": "u1",
+                                               "sent_at": _NOW, "message_preview": "Hello"}])
+        result = await get_recent_runs(pool, schedule_id=1, limit=5)
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["message_preview"] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_rows(self):
+        pool, conn = _make_pool(fetch=[])
+        result = await get_recent_runs(pool, schedule_id=1, limit=5)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_passes_schedule_id_and_limit(self):
+        pool, conn = _make_pool(fetch=[])
+        await get_recent_runs(pool, schedule_id=7, limit=3)
+        args = conn.fetch.call_args.args
+        assert 7 in args
+        assert 3 in args
+
+
+class TestPruneScheduleRunLog:
+    @pytest.mark.asyncio
+    async def test_executes_delete(self):
+        pool, conn = _make_pool()
+        await prune_schedule_run_log(pool, days=30)
+        assert conn.execute.called
+
+    @pytest.mark.asyncio
+    async def test_passes_days_value(self):
+        pool, conn = _make_pool()
+        await prune_schedule_run_log(pool, days=14)
+        args = conn.execute.call_args.args
+        assert 14 in args
+
+    @pytest.mark.asyncio
+    async def test_creates_table_in_init_tables(self):
+        pool, conn = _make_pool()
+        await init_tables(pool)
+        combined = " ".join(str(c) for c in conn.execute.call_args_list)
+        assert "schedule_run_log" in combined

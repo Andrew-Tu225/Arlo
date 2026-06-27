@@ -63,8 +63,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from core import db
-from core.llm import get_client, get_default_model
-from core.memory import store
 from core.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -73,20 +71,6 @@ logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 
 _MAX_DISCORD_CHARS = 1900
-
-# The task description for the default morning proactive DM.
-# Stored in the DB so the user can view and edit it via conversation in Phase 4.
-_MORNING_PROACTIVE_TASK = (
-    "Start a casual, engaging morning conversation with the user. "
-    "Based on their interests and profile, open with something relevant — "
-    "a question, a thought, something happening in a topic they care about, "
-    "or anything they'd enjoy talking about. "
-    "Make it feel like a friend reaching out, not a briefing or report. "
-    "If nothing stands out, ask how they're doing or bring up something "
-    "they've mentioned before. Never send a generic filler message."
-)
-
-_MORNING_SCHEDULE_NAME = "morning-proactive"
 
 
 # ---------------------------------------------------------------------------
@@ -99,43 +83,38 @@ def _hhmm_to_cron(hhmm: str) -> str:
     return f"{int(m)} {int(h)} * * *"
 
 
-def _build_prompt(*, task: str, profile_facts: list[str]) -> str:
-    """[Phase 3] Build the system prompt for the single-LLM-call agent.
-
-    Phase 4: removed — the ReAct agent constructs its own prompts per step.
-    """
-    parts = [f"Your task: {task}"]
-    if profile_facts:
-        facts = "\n".join(f"- {f}" for f in profile_facts[:10])
-        parts.append(f"\nUser profile facts:\n{facts}")
-    parts.append(
-        "\nIf there is genuinely nothing relevant to say, respond with exactly 'empty'. "
-        "Otherwise always send something — never leave the user without a message."
-    )
-    return "\n".join(parts)
-
-
 # ---------------------------------------------------------------------------
 # Startup: seed defaults
 # ---------------------------------------------------------------------------
 
 async def seed_default_schedules(pool, user_id: str) -> None:
-    """Seed the morning proactive DM schedule if it doesn't exist yet.
+    """Seed the single built-in default schedule: a morning proactive DM.
 
-    Called once from setup_hook after init_tables(), before scheduler.start().
-    Idempotent — insert_schedule uses ON CONFLICT DO NOTHING so restarting the
-    bot never duplicates or overwrites an existing row. If the user later edits
-    the schedule via conversation, the updated DB row persists across restarts.
+    This is the only schedule Arlo creates automatically. It is stored in the
+    `schedules` table so the user can view, edit, or delete it via conversation
+    just like any schedule they create themselves.
 
-    discord_channel_id = None means the job will DM the user directly.
+    Idempotent — ON CONFLICT DO NOTHING means restarting the bot never
+    duplicates or overwrites the row. If the user edits the task or cron
+    via conversation, those changes persist across restarts.
+
+    discord_channel_id = None → DM the user directly (no channel).
     """
     settings = get_settings()
     await db.insert_schedule(
         pool,
         user_id=user_id,
-        name=_MORNING_SCHEDULE_NAME,
-        task=_MORNING_PROACTIVE_TASK,
-        discord_channel_id=None,     #sent to DM by default
+        name="morning-proactive",
+        task=(
+            "Start a casual, engaging morning conversation with the user. "
+            "Based on their interests and profile, open with something relevant — "
+            "a question, a thought, something happening in a topic they care about, "
+            "or anything they'd enjoy talking about. "
+            "Make it feel like a friend reaching out, not a briefing or report. "
+            "If nothing stands out, ask how they're doing or bring up something "
+            "they've mentioned before. Never send a generic filler message."
+        ),
+        discord_channel_id=None,
         channel_topic=None,
         cron_schedule=_hhmm_to_cron(settings.digest_time),
     )
@@ -213,10 +192,13 @@ async def run_schedule_job(bot, pool, schedule_id: int) -> None:
             logger.warning("Schedule %s not found in DB; skipping", schedule_id)
             return
 
-        result = await run_schedule_agent(
+        from core.agent.proactive import run_proactive_agent  # lazy: breaks digest ↔ proactive cycle
+        result = await run_proactive_agent(
             task=sched["task"],
             user_id=sched["user_id"],
+            schedule_id=schedule_id,
             channel_topic=sched.get("channel_topic"),
+            pool=pool,
         )
 
         if not result:
@@ -242,56 +224,13 @@ async def run_schedule_job(bot, pool, schedule_id: int) -> None:
                 return
             await channel.send(result)
 
+        await db.insert_schedule_run(
+            pool,
+            schedule_id=schedule_id,
+            user_id=sched["user_id"],
+            message_preview=result[:150],
+        )
         await db.update_schedule_last_sent(pool, schedule_id=schedule_id)
 
     except Exception:
         logger.exception("run_schedule_job failed for schedule %s", schedule_id)
-
-
-# ---------------------------------------------------------------------------
-# Agent
-# ---------------------------------------------------------------------------
-
-async def run_schedule_agent(
-    *, task: str, user_id: str, channel_topic: str | None = None,
-) -> str:
-    """Compose a proactive message and return it as a string.
-
-    Called by run_schedule_job for all scheduled sends. Not called for
-    user-initiated messages — those go through orchestrator.run() in handlers.py.
-
-    Arguments:
-      task: the schedule's instruction for this run. For the morning default,
-          this is _MORNING_PROACTIVE_TASK. User can edit this via conversation.
-      user_id: used to fetch profile facts from mem0.
-      channel_topic: if set, prepended to the prompt so the LLM knows the
-          channel's purpose. None for DM-based schedules.
-
-    Returns "" if the agent decides nothing is worth sending. The caller
-    (run_schedule_job) skips the send in that case.
-
-    [Phase 3] Single LLM call with mem0 profile facts pre-loaded.
-
-    Phase 4: replace body with a ReAct agent loop (same pattern as
-    orchestrator.py). Add tools: search_memory, web_search, reddit_search,
-    notion_get_tasks, … channel_topic becomes a system prompt preamble.
-    """
-    profile_facts: list[str] = []
-    try:
-        profile_facts = await store.search("interests preferences habits", user_id)
-    except Exception:
-        logger.warning("store.search failed; proceeding without profile")
-
-    prompt_task = f"Channel context: {channel_topic}\n\n{task}" if channel_topic else task
-    system_prompt = _build_prompt(task=prompt_task, profile_facts=profile_facts)
-
-    try:
-        response = await get_client().chat.completions.create(
-            model=get_default_model(),
-            messages=[{"role": "system", "content": system_prompt}],
-        )
-        content = response.choices[0].message.content or ""
-        return "" if content.strip().lower() in ("", "empty", "nothing") else content.strip()
-    except Exception:
-        logger.exception("LLM call failed in run_schedule_agent")
-        return ""

@@ -40,6 +40,22 @@ class Settings(BaseSettings):
     max_react_iterations: int = 8
     task_token_budget: int = 8000
 
+    # Research sub-agent budgets
+    research_max_react_iterations: int = 12
+    research_task_token_budget: int = 12000
+
+    # Schedule planner sub-agent budgets
+    planner_max_react_iterations: int = 6
+    planner_task_token_budget: int = 6000
+
+    # Proactive agent budgets
+    proactive_max_react_iterations: int = 5
+    proactive_task_token_budget: int = 8000
+
+    # Observation / snippet caps
+    tool_observation_max_chars: int = 2000
+    tavily_snippet_max_chars: int = 280
+
     @model_validator(mode="after")
     def check_llm_key(self) -> "Settings":
         if self.llm_provider == "openai" and not self.openai_api_key:

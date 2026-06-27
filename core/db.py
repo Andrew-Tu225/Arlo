@@ -4,19 +4,26 @@ Owns all direct PostgreSQL access. The rest of the codebase calls functions
 here rather than managing connections themselves.
 
 Tables managed here:
-  episodic_messages — raw interaction log; source of truth for the context
-                      window (handlers.py reads) and the extraction job
-                      (extractor.py reads). 30-day retention; pruned weekly.
-  schedules         — all proactive jobs Arlo runs for the user: DM-based or
-                      channel-based, cron or event-driven. The morning proactive
-                      DM is seeded here at startup so the orchestrator can
-                      search, edit, or delete it via conversation in Phase 4.
-  arlo_channels     — Discord channels Arlo manages, each with a topic/purpose.
-                      Phase 4: handlers.py injects channel topic into the
-                      orchestrator prompt for channel-aware conversation.
+  episodic_messages  — raw interaction log; source of truth for the context
+                       window (handlers.py reads) and the extraction job
+                       (extractor.py reads). 30-day retention; pruned weekly.
+  schedules          — all proactive jobs Arlo runs for the user: DM-based or
+                       channel-based, cron or event-driven. The morning proactive
+                       DM is seeded here at startup so the orchestrator can
+                       search, edit, or delete it via conversation in Phase 4.
+  arlo_channels      — Discord channels Arlo manages, each with a topic/purpose.
+                       Phase 4: handlers.py injects channel topic into the
+                       orchestrator prompt for channel-aware conversation.
+  schedule_run_log   — per-schedule send history for the proactive agent. Enables
+                       the get_recent_sends tool to avoid repeating topics across
+                       runs. Scoped per schedule_id; cascade-deleted with schedule.
+                       30-day retention; pruned with episodic_messages.
 """
 
 from __future__ import annotations
+
+import json
+import logging
 
 import asyncpg
 
@@ -71,6 +78,33 @@ async def init_tables(pool: asyncpg.Pool) -> None:
                 created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
                 UNIQUE (user_id, discord_channel_id)
             )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id              SERIAL PRIMARY KEY,
+                user_id         TEXT NOT NULL,
+                tool_name       TEXT NOT NULL,
+                tool_args       JSONB NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                discord_msg_id  TEXT,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                resolved_at     TIMESTAMPTZ,
+                agent_state     JSONB
+            )
+        """)
+        await conn.execute("ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS agent_state JSONB")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_run_log (
+                id              BIGSERIAL PRIMARY KEY,
+                schedule_id     INTEGER NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+                user_id         TEXT NOT NULL,
+                sent_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+                message_preview TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS schedule_run_log_sched_time_idx
+                ON schedule_run_log (schedule_id, sent_at DESC)
         """)
 
 
@@ -198,6 +232,29 @@ async def insert_schedule(
     return row["id"]
 
 
+async def get_schedule_by_name(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    name: str,
+) -> dict | None:
+    """Return the schedule row for (user_id, name), or None."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, name, task, discord_channel_id, channel_topic,
+                   cron_schedule, poll_interval_secs, last_sent_at, enabled, created_at
+            FROM schedules
+            WHERE user_id = $1 AND name = $2
+            """,
+            user_id,
+            name,
+        )
+    if not rows:
+        return None
+    return {k: rows[0][k] for k in _SCHEDULE_COLS}
+
+
 async def get_schedule(pool: asyncpg.Pool, *, schedule_id: int) -> dict | None:
     """Return the schedule row for the given id, or None."""
     async with pool.acquire() as conn:
@@ -213,6 +270,22 @@ async def get_schedule(pool: asyncpg.Pool, *, schedule_id: int) -> dict | None:
     if not rows:
         return None
     return {k: rows[0][k] for k in _SCHEDULE_COLS}
+
+
+async def list_schedules_for_user(pool: asyncpg.Pool, *, user_id: str) -> list[dict]:
+    """Return all schedules for user_id, ordered by id."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, name, task, discord_channel_id, channel_topic,
+                   cron_schedule, poll_interval_secs, last_sent_at, enabled, created_at
+            FROM schedules
+            WHERE user_id = $1
+            ORDER BY id ASC
+            """,
+            user_id,
+        )
+    return [{k: row[k] for k in _SCHEDULE_COLS} for row in rows]
 
 
 async def get_enabled_schedules(pool: asyncpg.Pool, *, user_id: str) -> list[dict]:
@@ -304,6 +377,96 @@ async def update_schedule_last_sent(pool: asyncpg.Pool, *, schedule_id: int) -> 
 
 
 # ---------------------------------------------------------------------------
+# Pending actions (Phase 4 — medium-risk tool approval)
+# ---------------------------------------------------------------------------
+
+_PENDING_ACTION_COLS = (
+    "id", "user_id", "tool_name", "tool_args", "status",
+    "discord_msg_id", "created_at", "resolved_at", "agent_state",
+)
+
+
+async def insert_pending_action(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    tool_name: str,
+    tool_args: dict,
+    agent_state: dict | None = None,
+) -> int:
+    """Insert a pending medium-risk action and return its id."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO pending_actions (user_id, tool_name, tool_args, agent_state)
+            VALUES ($1, $2, $3::jsonb, $4::jsonb)
+            RETURNING id
+            """,
+            user_id,
+            tool_name,
+            json.dumps(tool_args),
+            json.dumps(agent_state) if agent_state is not None else None,
+        )
+    return row["id"]
+
+
+async def get_pending_action(
+    pool: asyncpg.Pool,
+    *,
+    pending_id: int,
+) -> dict | None:
+    """Return a pending_actions row by id, or None."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, tool_name, tool_args, status,
+                   discord_msg_id, created_at, resolved_at, agent_state
+            FROM pending_actions
+            WHERE id = $1
+            """,
+            pending_id,
+        )
+    if not rows:
+        return None
+    row = rows[0]
+    return {k: row[k] for k in _PENDING_ACTION_COLS}
+
+
+async def set_pending_action_discord_msg_id(
+    pool: asyncpg.Pool,
+    *,
+    pending_id: int,
+    discord_msg_id: str,
+) -> None:
+    """Store the Discord message id for the approval embed."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE pending_actions SET discord_msg_id = $2 WHERE id = $1",
+            pending_id,
+            discord_msg_id,
+        )
+
+
+async def resolve_pending_action(
+    pool: asyncpg.Pool,
+    *,
+    pending_id: int,
+    status: str,
+) -> None:
+    """Mark a pending action approved, rejected, or expired."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE pending_actions
+            SET status = $2, resolved_at = now()
+            WHERE id = $1
+            """,
+            pending_id,
+            status,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Arlo channels (Phase 4 — channel registry for conversation context)
 #
 # When user sends a message in a channel Arlo manages, handlers.py will look
@@ -382,4 +545,63 @@ async def set_channels_enabled(
         await conn.execute(
             "UPDATE arlo_channels SET enabled = $2 WHERE user_id = $1",
             user_id, enabled,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Schedule run log (proactive agent send history)
+#
+# Tracks all schedule sends so the proactive agent can avoid repeating topics.
+# Scoped per schedule_id — each schedule has independent history.
+# Cascade-deleted when the parent schedule row is removed.
+# ---------------------------------------------------------------------------
+
+async def insert_schedule_run(
+    pool: asyncpg.Pool,
+    *,
+    schedule_id: int,
+    user_id: str,
+    message_preview: str,
+) -> None:
+    """Log a successful schedule send. Called by digest.run_schedule_job after Discord send."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO schedule_run_log (schedule_id, user_id, message_preview)
+            VALUES ($1, $2, $3)
+            """,
+            schedule_id,
+            user_id,
+            message_preview,
+        )
+
+
+async def get_recent_runs(
+    pool: asyncpg.Pool,
+    *,
+    schedule_id: int,
+    limit: int,
+) -> list[dict]:
+    """Return the most recent run log rows for schedule_id, newest-first."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, schedule_id, user_id, sent_at, message_preview
+            FROM schedule_run_log
+            WHERE schedule_id = $1
+            ORDER BY sent_at DESC
+            LIMIT $2
+            """,
+            schedule_id,
+            limit,
+        )
+    return [dict(row) for row in rows]
+
+
+async def prune_schedule_run_log(pool: asyncpg.Pool, *, days: int = 30) -> None:
+    """Delete schedule_run_log rows older than `days` days."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM schedule_run_log WHERE sent_at < now() - ($1 || ' days')::interval",
+            days,
         )
