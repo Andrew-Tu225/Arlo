@@ -15,7 +15,7 @@ import json
 import textwrap
 from dataclasses import dataclass, field
 
-from core.agent.persona import build_system_prompt
+from core.agent.prompts import build_orchestrator_prompt as build_system_prompt
 from core.llm import get_client, get_default_model
 
 # ---------------------------------------------------------------------------
