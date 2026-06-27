@@ -4,16 +4,20 @@ Owns all direct PostgreSQL access. The rest of the codebase calls functions
 here rather than managing connections themselves.
 
 Tables managed here:
-  episodic_messages — raw interaction log; source of truth for the context
-                      window (handlers.py reads) and the extraction job
-                      (extractor.py reads). 30-day retention; pruned weekly.
-  schedules         — all proactive jobs Arlo runs for the user: DM-based or
-                      channel-based, cron or event-driven. The morning proactive
-                      DM is seeded here at startup so the orchestrator can
-                      search, edit, or delete it via conversation in Phase 4.
-  arlo_channels     — Discord channels Arlo manages, each with a topic/purpose.
-                      Phase 4: handlers.py injects channel topic into the
-                      orchestrator prompt for channel-aware conversation.
+  episodic_messages  — raw interaction log; source of truth for the context
+                       window (handlers.py reads) and the extraction job
+                       (extractor.py reads). 30-day retention; pruned weekly.
+  schedules          — all proactive jobs Arlo runs for the user: DM-based or
+                       channel-based, cron or event-driven. The morning proactive
+                       DM is seeded here at startup so the orchestrator can
+                       search, edit, or delete it via conversation in Phase 4.
+  arlo_channels      — Discord channels Arlo manages, each with a topic/purpose.
+                       Phase 4: handlers.py injects channel topic into the
+                       orchestrator prompt for channel-aware conversation.
+  schedule_run_log   — per-schedule send history for the proactive agent. Enables
+                       the get_recent_sends tool to avoid repeating topics across
+                       runs. Scoped per schedule_id; cascade-deleted with schedule.
+                       30-day retention; pruned with episodic_messages.
 """
 
 from __future__ import annotations
@@ -89,6 +93,19 @@ async def init_tables(pool: asyncpg.Pool) -> None:
             )
         """)
         await conn.execute("ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS agent_state JSONB")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_run_log (
+                id              BIGSERIAL PRIMARY KEY,
+                schedule_id     INTEGER NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+                user_id         TEXT NOT NULL,
+                sent_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+                message_preview TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS schedule_run_log_sched_time_idx
+                ON schedule_run_log (schedule_id, sent_at DESC)
+        """)
 
 
 # ---------------------------------------------------------------------------
@@ -528,4 +545,63 @@ async def set_channels_enabled(
         await conn.execute(
             "UPDATE arlo_channels SET enabled = $2 WHERE user_id = $1",
             user_id, enabled,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Schedule run log (proactive agent send history)
+#
+# Tracks all schedule sends so the proactive agent can avoid repeating topics.
+# Scoped per schedule_id — each schedule has independent history.
+# Cascade-deleted when the parent schedule row is removed.
+# ---------------------------------------------------------------------------
+
+async def insert_schedule_run(
+    pool: asyncpg.Pool,
+    *,
+    schedule_id: int,
+    user_id: str,
+    message_preview: str,
+) -> None:
+    """Log a successful schedule send. Called by digest.run_schedule_job after Discord send."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO schedule_run_log (schedule_id, user_id, message_preview)
+            VALUES ($1, $2, $3)
+            """,
+            schedule_id,
+            user_id,
+            message_preview,
+        )
+
+
+async def get_recent_runs(
+    pool: asyncpg.Pool,
+    *,
+    schedule_id: int,
+    limit: int,
+) -> list[dict]:
+    """Return the most recent run log rows for schedule_id, newest-first."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, schedule_id, user_id, sent_at, message_preview
+            FROM schedule_run_log
+            WHERE schedule_id = $1
+            ORDER BY sent_at DESC
+            LIMIT $2
+            """,
+            schedule_id,
+            limit,
+        )
+    return [dict(row) for row in rows]
+
+
+async def prune_schedule_run_log(pool: asyncpg.Pool, *, days: int = 30) -> None:
+    """Delete schedule_run_log rows older than `days` days."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM schedule_run_log WHERE sent_at < now() - ($1 || ' days')::interval",
+            days,
         )

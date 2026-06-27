@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     planner_max_react_iterations: int = 6
     planner_task_token_budget: int = 6000
 
+    # Proactive agent budgets
+    proactive_max_react_iterations: int = 5
+    proactive_task_token_budget: int = 8000
+
     # Observation / snippet caps
     tool_observation_max_chars: int = 2000
     tavily_snippet_max_chars: int = 280

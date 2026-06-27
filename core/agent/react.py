@@ -149,12 +149,14 @@ def build_react_graph(
         configurable = config.get("configurable", {})
         pool = configurable.get("pool")
         bot = configurable.get("bot")
+        schedule_id = configurable.get("schedule_id")       #used by schedule execution, None if not executing schedule
 
         ctx = ToolContext(
             user_id=state.get("user_id") or "",
             pool=pool,
             bot=bot,
             discord_channel_id=state.get("discord_channel_id"),
+            schedule_id=schedule_id,
         )
         tool_map = {t.name: t for t in graph_config.tool_builder(ctx)}
         max_obs_chars = get_settings().tool_observation_max_chars
